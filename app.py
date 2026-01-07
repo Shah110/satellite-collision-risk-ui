@@ -38,21 +38,12 @@ FEATURE_MAP_FILE = st.sidebar.text_input("Feature map file (optional)", value="f
 st.sidebar.caption("feature_map.csv must have columns: model_feature, original_feature")
 
 st.sidebar.divider()
-st.sidebar.subheader("🚨 Alert Threshold")
-
-alert_mode = st.sidebar.radio(
-    "Alert based on:",
-    ["Auto (Probability if available, else Score, else Pred)", "Probability", "Score", "Predicted value"],
-    index=0
-)
-
-prob_threshold = st.sidebar.slider("Probability threshold", 0.0, 1.0, 0.50, 0.01)
-score_threshold = st.sidebar.number_input("Score threshold (decision_function)", value=0.0, step=0.1)
-pred_threshold = st.sidebar.slider("Predicted value threshold", 0.0, 1.0, 0.50, 0.01)
+st.sidebar.subheader("🚨 Alert Threshold (Risk Score)")
+risk_threshold = st.sidebar.slider("Risk score threshold (0–1)", 0.0, 1.0, 0.50, 0.01)
+st.sidebar.caption("This is a score from model predictions (not a true probability unless your model supports it).")
 
 st.sidebar.divider()
 st.sidebar.subheader("🛰️ Conjunction Ops Controls")
-
 delta_v = st.sidebar.slider("ΔV burn magnitude (m/s)", 0.0, 2.0, 0.0, 0.01)
 burn_direction = st.sidebar.selectbox(
     "ΔV direction (relative frame)",
@@ -106,11 +97,9 @@ def get_risk_output(model, X_aligned: pd.DataFrame):
     kind: 'proba' | 'score' | 'pred'
     values: 1D array
     """
-    # Probability
     if hasattr(model, "predict_proba"):
         try:
-            p = model.predict_proba(X_aligned)
-            p = np.asarray(p)
+            p = np.asarray(model.predict_proba(X_aligned))
             if p.ndim == 2 and p.shape[1] >= 2:
                 return "proba", p[:, 1]
             if p.ndim == 1:
@@ -118,18 +107,34 @@ def get_risk_output(model, X_aligned: pd.DataFrame):
         except Exception:
             pass
 
-    # Score
     if hasattr(model, "decision_function"):
         try:
             s = model.decision_function(X_aligned)
-            s = np.asarray(s).reshape(-1)
-            return "score", s
+            return "score", np.asarray(s).reshape(-1)
         except Exception:
             pass
 
-    # Prediction fallback
     y = model.predict(X_aligned)
     return "pred", np.asarray(y).reshape(-1)
+
+def normalize_0_1(x: np.ndarray) -> np.ndarray:
+    """
+    Normalize array to [0,1] for UI score display.
+    If the model already outputs [0,1], it stays almost the same.
+    """
+    x = np.asarray(x, dtype=float).reshape(-1)
+    if len(x) == 0:
+        return x
+    mn, mx = float(np.min(x)), float(np.max(x))
+
+    # If already in [0,1] (allow small tolerance), keep as-is
+    if mn >= -1e-9 and mx <= 1.0 + 1e-9:
+        return np.clip(x, 0.0, 1.0)
+
+    # Otherwise normalize
+    if np.isclose(mx - mn, 0.0):
+        return np.zeros_like(x)
+    return (x - mn) / (mx - mn)
 
 def format_countdown(delta: timedelta) -> str:
     total = int(delta.total_seconds())
@@ -213,49 +218,18 @@ def build_event_labels(df: pd.DataFrame) -> pd.Series:
         return df[cols_lower["event_id"]].astype(str)
     return pd.Series([f"Event #{i}" for i in range(len(df))], index=df.index)
 
-def choose_alert_kind(kind_available: str) -> str:
-    if alert_mode.startswith("Probability"):
-        return "proba"
-    if alert_mode.startswith("Score"):
-        return "score"
-    if alert_mode.startswith("Predicted"):
-        return "pred"
-    # Auto:
-    if kind_available == "proba":
-        return "proba"
-    if kind_available == "score":
-        return "score"
-    return "pred"
-
-def show_alert(kind: str, value: float | None):
-    if value is None:
-        st.info("Alert value not available.")
-        return
-
-    if kind == "proba":
-        if value >= prob_threshold:
-            st.error(f"⚠️ ALERT: Probability {value:.3f} ≥ {prob_threshold:.2f}")
-        else:
-            st.success(f"✅ OK: Probability {value:.3f} < {prob_threshold:.2f}")
-
-    elif kind == "score":
-        if value >= score_threshold:
-            st.error(f"⚠️ ALERT: Score {value:.3f} ≥ {score_threshold:.2f}")
-        else:
-            st.success(f"✅ OK: Score {value:.3f} < {score_threshold:.2f}")
-
-    else:  # pred
-        if value >= pred_threshold:
-            st.error(f"⚠️ ALERT: Predicted value {value:.3f} ≥ {pred_threshold:.2f}")
-        else:
-            st.success(f"✅ OK: Predicted value {value:.3f} < {pred_threshold:.2f}")
-
 def operator_recommendation(hours_to_tca: float) -> str:
     if hours_to_tca < 24:
         return "🔴 **DECIDE NOW:** Request urgent tracking update + prepare/execute maneuver if needed."
     if hours_to_tca <= 72:
         return "🟡 **MONITOR:** Continue monitoring, coordinate, and pre-plan maneuver options."
     return "🟢 **PLAN:** Normal monitoring and planning."
+
+def show_risk_badge(score_0_1: float):
+    if score_0_1 >= risk_threshold:
+        st.error(f"⚠️ ALERT: Risk Score {score_0_1:.3f} ≥ {risk_threshold:.2f}")
+    else:
+        st.success(f"✅ OK: Risk Score {score_0_1:.3f} < {risk_threshold:.2f}")
 
 # ==========================================================
 # Session state for scenario saving
@@ -342,30 +316,23 @@ with tab_dataset:
     with st.expander("Preview (Original Names if mapping exists)", expanded=True):
         st.dataframe(display_df.head(50), use_container_width=True)
 
-    # Always show a distribution plot (proba -> score -> pred)
+    # Distribution always shown as a "Risk Score (0–1)"
     X_all = df.drop(columns=[TARGET_COL], errors="ignore")
     X_all = safe_numeric(X_all)
     X_all_aligned = align_features_for_model(model, X_all)
+
     kind_all, values_all = get_risk_output(model, X_all_aligned)
+    risk_all = normalize_0_1(values_all)
 
-    if kind_all == "proba":
-        st.subheader("Risk Probability Distribution")
-        fig = go.Figure(data=[go.Histogram(x=values_all, nbinsx=30)])
-        fig.update_layout(height=320, xaxis_title="Probability", yaxis_title="Count", bargap=0.05)
-        st.plotly_chart(fig, use_container_width=True)
+    st.subheader("Risk Score Distribution (0–1)")
+    fig = go.Figure(data=[go.Histogram(x=risk_all, nbinsx=30)])
+    fig.update_layout(height=320, xaxis_title="Risk Score (0–1)", yaxis_title="Count", bargap=0.05)
+    st.plotly_chart(fig, use_container_width=True)
 
-    elif kind_all == "score":
-        st.subheader("Risk Score Distribution (decision_function)")
-        fig = go.Figure(data=[go.Histogram(x=values_all, nbinsx=30)])
-        fig.update_layout(height=320, xaxis_title="Score", yaxis_title="Count", bargap=0.05)
-        st.plotly_chart(fig, use_container_width=True)
-
-    else:
-        st.subheader("Predicted Risk Distribution (predict output)")
-        fig = go.Figure(data=[go.Histogram(x=values_all, nbinsx=30)])
-        fig.update_layout(height=320, xaxis_title="Predicted value", yaxis_title="Count", bargap=0.05)
-        st.plotly_chart(fig, use_container_width=True)
-        st.info("Note: Your model does not provide probabilities/scores, so we are plotting predicted values.")
+    st.caption(
+        f"Model output type: **{kind_all}**. "
+        "Risk Score is normalized to 0–1 for visualization (not a true probability unless your model provides it)."
+    )
 
 # ==========================================================
 # TAB 2: Prediction
@@ -379,29 +346,18 @@ with tab_prediction:
     X1_aligned = align_features_for_model(model, X1)
 
     kind1, values1 = get_risk_output(model, X1_aligned)
-    chosen_kind = choose_alert_kind(kind1)
-
-    pred_value = float(values1[0]) if len(values1) else None
+    raw_value = float(values1[0]) if len(values1) else 0.0
+    risk_score = float(normalize_0_1(np.array([raw_value]))[0])
 
     hours_to_tca = (tca_dt - datetime.now()).total_seconds() / 3600.0
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Predicted Risk (value)", "N/A" if pred_value is None else f"{pred_value:.4f}")
-    c2.metric("Alert Mode", chosen_kind.upper())
-    c3.metric("Hours to TCA", f"{hours_to_tca:.1f}")
-    c4.metric("Selected Event", selected_label)
+    c1.metric("Risk Score (0–1)", f"{risk_score:.3f}")
+    c2.metric("Raw Model Output", f"{raw_value:.4f}")
+    c3.metric("Model Output Type", kind1)
+    c4.metric("Hours to TCA", f"{hours_to_tca:.1f}")
 
-    # Alert value depends on chosen kind
-    alert_val = None
-    if chosen_kind == "proba" and kind1 == "proba":
-        alert_val = float(values1[0])
-    elif chosen_kind == "score" and kind1 == "score":
-        alert_val = float(values1[0])
-    else:
-        # predicted value (always available)
-        alert_val = float(values1[0]) if len(values1) else None
-
-    show_alert(chosen_kind, alert_val)
+    show_risk_badge(risk_score)
 
     st.markdown("### Operator Recommendation (time-based)")
     st.write(operator_recommendation(hours_to_tca))
@@ -409,9 +365,12 @@ with tab_prediction:
     st.markdown("### Selected Event Data (display)")
     st.dataframe(rename_for_display(single_df, feature_map), use_container_width=True)
 
+    # Optional: show expected features
     if hasattr(model, "feature_names_in_"):
         expected = list(model.feature_names_in_)
-        exp_table = pd.DataFrame({"Model Feature": expected, "Original Name": [feature_map.get(c, c) for c in expected]})
+        exp_table = pd.DataFrame(
+            {"Model Feature": expected, "Original Name": [feature_map.get(c, c) for c in expected]}
+        )
         with st.expander("Model expected features (Original Names)", expanded=False):
             st.dataframe(exp_table, use_container_width=True)
 
@@ -422,7 +381,7 @@ with tab_maneuver:
     st.subheader("Maneuver Simulator + Error Ellipsoids (3D)")
     st.caption(
         "This uses a **simple linear relative-motion demo** around TCA: r(t)=r0+v0*t. "
-        "The ML prediction uses dataset features; this maneuver plot is a visualization."
+        "The maneuver plot is a visualization and does not change ML predictions unless you retrain your model."
     )
 
     cols = list(df.columns)
