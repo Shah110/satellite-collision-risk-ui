@@ -2,20 +2,20 @@ import streamlit as st
 import pandas as pd
 import joblib
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import numpy as np
 import plotly.graph_objects as go
 
-# -----------------------------
+# ==========================================================
 # Page Config
-# -----------------------------
+# ==========================================================
 st.set_page_config(page_title="Satellite Collision Risk UI", layout="wide")
 st.title("🛰️ Satellite Collision Risk UI")
 st.success("App is running ✅")
 
-# -----------------------------
+# ==========================================================
 # Sidebar: Links + Settings
-# -----------------------------
+# ==========================================================
 st.sidebar.header("🚀 Project Notebooks (Colab)")
 st.sidebar.markdown(
     "- [Phase 1](https://colab.research.google.com/drive/1Utaq_FtgsHhV215frPX-CQhC6nMwkfs3?usp=sharing)\n"
@@ -43,15 +43,19 @@ burn_direction = st.sidebar.selectbox(
 )
 
 # --- TCA datetime
-# User timezone assumed Europe/Istanbul -> UTC+3 typically, but easiest: show local naive.
-today = datetime.now()
-tca_date = st.sidebar.date_input("TCA date", value=today.date())
-tca_time = st.sidebar.time_input("TCA time", value=(today + timedelta(hours=48)).time())
+now_local = datetime.now()
+tca_date = st.sidebar.date_input("TCA date", value=now_local.date())
+tca_time = st.sidebar.time_input("TCA time", value=(now_local + timedelta(hours=48)).time())
 tca_dt = datetime.combine(tca_date, tca_time)
 
-# -----------------------------
+st.sidebar.divider()
+st.sidebar.subheader("🧾 Feature Name Display")
+FEATURE_MAP_FILE = st.sidebar.text_input("Feature map file (optional)", value="feature_map.csv")
+st.sidebar.caption("Create feature_map.csv with columns: model_feature, original_feature")
+
+# ==========================================================
 # Helpers
-# -----------------------------
+# ==========================================================
 @st.cache_data
 def load_csv(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
@@ -60,17 +64,30 @@ def load_csv(path: str) -> pd.DataFrame:
 def load_model(path: str):
     return joblib.load(path)
 
-def align_features_for_model(model, X: pd.DataFrame) -> pd.DataFrame:
-    if hasattr(model, "feature_names_in_"):
-        expected = list(model.feature_names_in_)
-        return X.reindex(columns=expected, fill_value=0)
-    return X
+@st.cache_data
+def load_feature_map(path: str) -> dict:
+    fm = pd.read_csv(path)
+    if not {"model_feature", "original_feature"}.issubset(fm.columns):
+        raise ValueError("feature_map.csv must contain columns: model_feature, original_feature")
+    return dict(zip(fm["model_feature"].astype(str), fm["original_feature"].astype(str)))
+
+def display_name(col: str, fmap: dict) -> str:
+    return fmap.get(str(col), str(col))
+
+def display_names(cols, fmap: dict):
+    return [display_name(c, fmap) for c in cols]
 
 def safe_numeric(df: pd.DataFrame) -> pd.DataFrame:
     X = df.copy()
     for c in X.columns:
         X[c] = pd.to_numeric(X[c], errors="ignore")
     return X.select_dtypes(include=["number"]).fillna(0)
+
+def align_features_for_model(model, X: pd.DataFrame) -> pd.DataFrame:
+    if hasattr(model, "feature_names_in_"):
+        expected = list(model.feature_names_in_)
+        return X.reindex(columns=expected, fill_value=0)
+    return X
 
 def format_countdown(delta: timedelta) -> str:
     total = int(delta.total_seconds())
@@ -119,14 +136,7 @@ def make_countdown_card(tca_dt: datetime):
     )
 
 def ellipsoid_mesh(center, cov, n=24, k=3.0):
-    """
-    Create 3D ellipsoid surface points from covariance.
-    center: (3,)
-    cov: (3,3)
-    k: scale (e.g., 3-sigma)
-    """
     cov = np.array(cov, dtype=float)
-    # Ensure symmetric positive-ish
     cov = 0.5 * (cov + cov.T)
     vals, vecs = np.linalg.eigh(cov)
     vals = np.clip(vals, 1e-12, None)
@@ -138,8 +148,7 @@ def ellipsoid_mesh(center, cov, n=24, k=3.0):
     y = np.outer(np.sin(u), np.sin(v))
     z = np.outer(np.ones_like(u), np.cos(v))
 
-    # scale
-    xyz = np.stack([x, y, z], axis=-1)  # (n,n,3)
+    xyz = np.stack([x, y, z], axis=-1)
     scaled = xyz @ np.diag(radii)
     rotated = scaled @ vecs.T
     pts = rotated + np.array(center)
@@ -147,22 +156,10 @@ def ellipsoid_mesh(center, cov, n=24, k=3.0):
     return pts[..., 0], pts[..., 1], pts[..., 2]
 
 def propagate_relative_motion(r0, v0, t_seconds):
-    """
-    Simple linear relative motion: r(t)=r0+v0*t
-    r0, v0: (3,)
-    t_seconds: array
-    returns r(t): (len(t),3)
-    """
     t = np.asarray(t_seconds).reshape(-1, 1)
     return r0.reshape(1, 3) + v0.reshape(1, 3) * t
 
-def apply_delta_v(v0, r0, dv, direction):
-    """
-    Apply dv in a chosen direction in relative frame.
-    - Along-track: along v0 (if v0 near 0, default x)
-    - Radial: +X
-    - Cross-track: +Z
-    """
+def apply_delta_v(v0, dv, direction):
     v0 = np.array(v0, dtype=float)
     if direction.startswith("Along-track"):
         norm = np.linalg.norm(v0)
@@ -174,22 +171,18 @@ def apply_delta_v(v0, r0, dv, direction):
     return v0 + dv * unit
 
 def default_cov(km_sigma=0.2):
-    """
-    Default covariance (km^2) for uncertainty ellipsoid.
-    km_sigma=0.2 means 200m 1-sigma on each axis.
-    """
-    s2 = (km_sigma ** 2)
+    s2 = km_sigma ** 2
     return np.diag([s2, s2, s2])
 
-# -----------------------------
+# ==========================================================
 # Countdown (C)
-# -----------------------------
+# ==========================================================
 st.header("⏱️ TCA Countdown")
 make_countdown_card(tca_dt)
 
-# -----------------------------
+# ==========================================================
 # Load Dataset
-# -----------------------------
+# ==========================================================
 st.header("📊 Dataset")
 
 df = None
@@ -212,9 +205,9 @@ st.write("**Shape:**", df.shape)
 with st.expander("Show dataset preview", expanded=True):
     st.dataframe(df.head(30), use_container_width=True)
 
-# -----------------------------
-# Load Model
-# -----------------------------
+# ==========================================================
+# Load Model + Feature Mapping
+# ==========================================================
 st.header("🧩 Model")
 
 if not Path(MODEL_FILE).exists():
@@ -228,9 +221,30 @@ except Exception as e:
     st.error(f"Failed to load model: {e}")
     st.stop()
 
-# -----------------------------
-# Prediction Panel (same as your current logic)
-# -----------------------------
+feature_map = {}
+if FEATURE_MAP_FILE and Path(FEATURE_MAP_FILE).exists():
+    try:
+        feature_map = load_feature_map(FEATURE_MAP_FILE)
+        st.info(f"✅ Feature mapping loaded from `{FEATURE_MAP_FILE}`")
+    except Exception as e:
+        st.warning(f"⚠️ Found `{FEATURE_MAP_FILE}` but failed to load: {e}")
+else:
+    st.warning("ℹ️ No feature_map.csv found. UI will show model feature names (feature_0...).")
+
+if hasattr(model, "feature_names_in_"):
+    expected = list(model.feature_names_in_)
+    with st.expander("Model expected features (Original Names)", expanded=False):
+        st.dataframe(
+            pd.DataFrame({
+                "Model Feature": expected,
+                "Original Name": display_names(expected, feature_map)
+            }),
+            use_container_width=True
+        )
+
+# ==========================================================
+# Prediction Panel
+# ==========================================================
 st.header("🚀 Prediction Panel")
 
 X = df.drop(columns=[TARGET_COL], errors="ignore")
@@ -250,9 +264,9 @@ m2.metric("Missing vs model", len(missing_cols))
 m3.metric("Extra vs model", len(extra_cols))
 
 if missing_cols:
-    st.warning(f"Missing columns filled with 0 (up to 25): {missing_cols[:25]}")
+    st.warning(f"Missing columns (filled with 0) (up to 25): {display_names(missing_cols, feature_map)[:25]}")
 if extra_cols:
-    st.info(f"Extra columns ignored (up to 25): {extra_cols[:25]}")
+    st.info(f"Extra columns ignored (up to 25): {display_names(extra_cols, feature_map)[:25]}")
 
 predict = st.button("🧠 Predict Collision Risk", type="primary")
 if predict:
@@ -279,12 +293,10 @@ if predict:
 st.header("🧭 Maneuver Simulator + Uncertainty (3D)")
 
 st.caption(
-    "This visualization uses a **simple relative-motion model** around TCA: "
-    "r(t)=r0+v0*t. If your CSV has better orbital states/covariances, we can wire them in."
+    "This is a **simple relative-motion demo** around TCA: r(t)=r0+v0*t. "
+    "If your CSV has real state/covariance columns, we can wire them in."
 )
 
-# ---- Inputs for relative state (try to use CSV columns if present)
-# We allow user to pick columns if they exist.
 cols = list(df.columns)
 
 state_cols_default = {
@@ -297,12 +309,14 @@ state_cols_default = {
 }
 
 with st.expander("State configuration (optional)", expanded=False):
-    st.write("If your CSV has relative position/velocity columns, select them here. Otherwise we use a demo state.")
+    st.write("Pick relative state columns if they exist in your CSV (we will show original names too).")
 
     def pick_col(label, default_name):
         candidates = [c for c in cols if c.lower() == default_name.lower()]
         default = candidates[0] if candidates else None
-        return st.selectbox(label, options=[None] + cols, index=0 if default is None else (1 + cols.index(default)))
+        options = [None] + cols
+        idx = 0 if default is None else (1 + cols.index(default))
+        return st.selectbox(label, options=options, index=idx)
 
     c1, c2 = st.columns(2)
     with c1:
@@ -314,12 +328,10 @@ with st.expander("State configuration (optional)", expanded=False):
         vy_col = pick_col("Relative Vy (km/s) column", state_cols_default["vy"])
         vz_col = pick_col("Relative Vz (km/s) column", state_cols_default["vz"])
 
-# Choose a row (a conjunction case)
 row_idx = st.number_input("Select conjunction row index", min_value=0, max_value=max(0, len(df)-1), value=0, step=1)
 
-# Demo fallback state (km, km/s)
-r0_demo = np.array([0.3, 0.2, 0.05])      # 300m,200m,50m offset
-v0_demo = np.array([-0.0006, 0.0004, 0.0])  # km/s (0.6 m/s, 0.4 m/s)
+r0_demo = np.array([0.3, 0.2, 0.05])
+v0_demo = np.array([-0.0006, 0.0004, 0.0])
 
 row = df.iloc[int(row_idx)]
 
@@ -334,53 +346,41 @@ def get_state():
     return r0_demo, v0_demo, False
 
 r0_km, v0_kms, using_csv = get_state()
-
 st.info("Using CSV state ✅" if using_csv else "Using DEMO state (no relative state columns selected).")
 
-# Time axis around TCA: +/- 2 hours
 span_hours = st.slider("Time window around TCA (hours)", 0.5, 12.0, 2.0, 0.5)
 N = 160
-t = np.linspace(-span_hours*3600, span_hours*3600, N)  # seconds
+t = np.linspace(-span_hours*3600, span_hours*3600, N)
 
-# Nominal trajectory
 r_nom = propagate_relative_motion(r0_km, v0_kms, t)
 
-# Maneuver: apply delta-v at "now" (assume burn at start of window, simple)
-dv_kms = delta_v / 1000.0  # m/s -> km/s
-v_man = apply_delta_v(v0_kms, r0_km, dv_kms, burn_direction)
+dv_kms = delta_v / 1000.0
+v_man = apply_delta_v(v0_kms, dv_kms, burn_direction)
 r_man = propagate_relative_motion(r0_km, v_man, t)
 
-# Miss distances (km)
 miss_nom_km = np.linalg.norm(r_nom, axis=1)
 miss_man_km = np.linalg.norm(r_man, axis=1)
 
-# TCA is at t=0 in this local window
 tca_idx = np.argmin(np.abs(t))
 md_nom = miss_nom_km[tca_idx]
 md_man = miss_man_km[tca_idx]
 
-kpi1, kpi2, kpi3 = st.columns(3)
-kpi1.metric("Miss Distance @TCA (Nominal)", f"{md_nom*1000:.1f} m")
-kpi2.metric("Miss Distance @TCA (Maneuvered)", f"{md_man*1000:.1f} m")
-kpi3.metric("Increase", f"{(md_man-md_nom)*1000:.1f} m")
+k1, k2, k3 = st.columns(3)
+k1.metric("Miss Distance @TCA (Nominal)", f"{md_nom*1000:.1f} m")
+k2.metric("Miss Distance @TCA (Maneuvered)", f"{md_man*1000:.1f} m")
+k3.metric("Increase", f"{(md_man-md_nom)*1000:.1f} m")
 
-# ---- Uncertainty ellipsoids (B)
-# If you have covariance columns, we can map them. For now:
-cov1 = default_cov(km_sigma=0.2)  # Sat A
-cov2 = default_cov(km_sigma=0.2)  # Sat B
+cov1 = default_cov(km_sigma=0.2)
+cov2 = default_cov(km_sigma=0.2)
 
-# For visualization: Sat A at origin, Sat B at relative position r(t)
 satA_center = np.array([0.0, 0.0, 0.0])
 satB_center_nom = r_nom[tca_idx]
 satB_center_man = r_man[tca_idx]
 
-# Build ellipsoid meshes at TCA
 x1, y1, z1 = ellipsoid_mesh(satA_center, cov1, n=26, k=3.0)
 x2n, y2n, z2n = ellipsoid_mesh(satB_center_nom, cov2, n=26, k=3.0)
 x2m, y2m, z2m = ellipsoid_mesh(satB_center_man, cov2, n=26, k=3.0)
 
-# Rough overlap indicator (simple heuristic)
-# Overlap likely if center distance < 3sigma_A + 3sigma_B (along worst axis)
 sigA = np.sqrt(np.max(np.linalg.eigvalsh(cov1))) * 3.0
 sigB = np.sqrt(np.max(np.linalg.eigvalsh(cov2))) * 3.0
 overlap_nom = (np.linalg.norm(satB_center_nom - satA_center) < (sigA + sigB))
@@ -392,24 +392,20 @@ st.write(
     f"Maneuvered = {'⚠️ High' if overlap_man else '✅ Low'}"
 )
 
-# ---- 3D Plot: two paths + ellipsoids
 fig = go.Figure()
 
-# Nominal relative path
 fig.add_trace(go.Scatter3d(
     x=r_nom[:, 0], y=r_nom[:, 1], z=r_nom[:, 2],
     mode="lines",
-    name="Nominal Path (Sat B relative to Sat A)"
+    name="Nominal Path"
 ))
 
-# Maneuvered relative path
 fig.add_trace(go.Scatter3d(
     x=r_man[:, 0], y=r_man[:, 1], z=r_man[:, 2],
     mode="lines",
-    name="Maneuvered Path (ΔV applied)"
+    name="Maneuvered Path (ΔV)"
 ))
 
-# Mark TCA points
 fig.add_trace(go.Scatter3d(
     x=[satB_center_nom[0]], y=[satB_center_nom[1]], z=[satB_center_nom[2]],
     mode="markers",
@@ -423,7 +419,6 @@ fig.add_trace(go.Scatter3d(
     marker=dict(size=5)
 ))
 
-# Ellipsoid: Sat A
 fig.add_trace(go.Surface(
     x=x1, y=y1, z=z1,
     name="Sat A Uncertainty (3σ)",
@@ -431,7 +426,6 @@ fig.add_trace(go.Surface(
     opacity=0.18
 ))
 
-# Ellipsoid: Sat B (Nominal)
 fig.add_trace(go.Surface(
     x=x2n, y=y2n, z=z2n,
     name="Sat B Uncertainty @TCA (Nominal, 3σ)",
@@ -439,7 +433,6 @@ fig.add_trace(go.Surface(
     opacity=0.18
 ))
 
-# Ellipsoid: Sat B (Maneuvered)
 fig.add_trace(go.Surface(
     x=x2m, y=y2m, z=z2m,
     name="Sat B Uncertainty @TCA (Maneuvered, 3σ)",
@@ -460,7 +453,6 @@ fig.update_layout(
 
 st.plotly_chart(fig, use_container_width=True)
 
-# Optional debug
 if show_debug:
     st.subheader("Debug")
     st.write("r0_km:", r0_km)
