@@ -22,9 +22,9 @@ st.sidebar.markdown(
     "- [Phase 2](https://colab.research.google.com/drive/1oog4BFnxr5ohss8HHJszAzv2rZqWFJO3?usp=sharing)\n"
     "- [Phase 3](https://colab.research.google.com/drive/1DGncV8CkSyTKbe5YBfqrTC-qrQxwfau-?usp=sharing)"
 )
+
 st.sidebar.divider()
 st.sidebar.subheader("⚙️ Data / Model Settings")
-
 DATA_FILE = st.sidebar.text_input("Dataset file in repo", value="combined_data.csv")
 MODEL_FILE = st.sidebar.text_input("Model file in repo", value="collision_risk_model.pkl")
 TARGET_COL = st.sidebar.text_input("Target column (if exists)", value="risk")
@@ -39,19 +39,25 @@ st.sidebar.caption("feature_map.csv must have columns: model_feature, original_f
 
 st.sidebar.divider()
 st.sidebar.subheader("🚨 Alert Threshold")
-risk_threshold = st.sidebar.slider("Risk probability alert threshold", 0.0, 1.0, 0.50, 0.01)
+
+alert_mode = st.sidebar.radio(
+    "Alert based on:",
+    ["Auto (Probability if available, else Score)", "Probability", "Score"],
+    index=0
+)
+
+prob_threshold = st.sidebar.slider("Probability threshold", 0.0, 1.0, 0.50, 0.01)
+score_threshold = st.sidebar.number_input("Score threshold (decision_function)", value=0.0, step=0.1)
 
 st.sidebar.divider()
 st.sidebar.subheader("🛰️ Conjunction Ops Controls")
 
-# --- Delta-V slider
-delta_v = st.sidebar.slider("ΔV burn magnitude (m/s)", min_value=0.0, max_value=2.0, value=0.0, step=0.01)
+delta_v = st.sidebar.slider("ΔV burn magnitude (m/s)", 0.0, 2.0, 0.0, 0.01)
 burn_direction = st.sidebar.selectbox(
-    "ΔV direction (in relative frame)",
+    "ΔV direction (relative frame)",
     ["Along-track (V direction)", "Radial (X)", "Cross-track (Z)"]
 )
 
-# --- TCA datetime
 now_local = datetime.now()
 tca_date = st.sidebar.date_input("TCA date", value=now_local.date())
 tca_time = st.sidebar.time_input("TCA time", value=(now_local + timedelta(hours=48)).time())
@@ -87,35 +93,47 @@ def align_features_for_model(model, X: pd.DataFrame) -> pd.DataFrame:
         return X.reindex(columns=expected, fill_value=0)
     return X
 
-# ✅ One-shot DISPLAY rename (UI only)
 def rename_for_display(df_in: pd.DataFrame, fmap: dict) -> pd.DataFrame:
     if not fmap:
         return df_in
     rename_dict = {k: v for k, v in fmap.items() if k in df_in.columns}
     return df_in.rename(columns=rename_dict)
 
-def get_probabilities(model, X_aligned: pd.DataFrame):
+def get_risk_output(model, X_aligned: pd.DataFrame):
     """
-    Returns a 1D probability array for 'positive/risk' class if possible, else None.
+    Returns (kind, values)
+    kind: 'proba' | 'score' | 'pred'
+    values: 1D array
     """
+    # Probability
     if hasattr(model, "predict_proba"):
         try:
-            proba = model.predict_proba(X_aligned)
-            if isinstance(proba, np.ndarray) and proba.ndim == 2 and proba.shape[1] >= 2:
-                return proba[:, 1]
-            if isinstance(proba, np.ndarray) and proba.ndim == 1:
-                return proba
+            p = model.predict_proba(X_aligned)
+            p = np.asarray(p)
+            if p.ndim == 2 and p.shape[1] >= 2:
+                return "proba", p[:, 1]
+            if p.ndim == 1:
+                return "proba", p
         except Exception:
-            return None
-    return None
+            pass
+
+    # Score (SVM/linear models)
+    if hasattr(model, "decision_function"):
+        try:
+            s = model.decision_function(X_aligned)
+            s = np.asarray(s).reshape(-1)
+            return "score", s
+        except Exception:
+            pass
+
+    # Fallback prediction
+    y = model.predict(X_aligned)
+    return "pred", np.asarray(y).reshape(-1)
 
 def format_countdown(delta: timedelta) -> str:
     total = int(delta.total_seconds())
-    if total < 0:
-        total = abs(total)
-        sign = "-"
-    else:
-        sign = ""
+    sign = "-" if total < 0 else ""
+    total = abs(total)
     days = total // 86400
     hrs = (total % 86400) // 3600
     mins = (total % 3600) // 60
@@ -125,7 +143,7 @@ def format_countdown(delta: timedelta) -> str:
 def countdown_color(hours_to_tca: float) -> str:
     if hours_to_tca < 24:
         return "#ff4d4f"
-    if 24 <= hours_to_tca <= 72:
+    if hours_to_tca <= 72:
         return "#faad14"
     return "#52c41a"
 
@@ -133,23 +151,17 @@ def make_countdown_card(tca_dt: datetime):
     now = datetime.now()
     delta = tca_dt - now
     hours_to_tca = delta.total_seconds() / 3600.0
-
     color = countdown_color(hours_to_tca)
     label = "RED: < 24h (DECIDE NOW)" if hours_to_tca < 24 else ("YELLOW: 24–72h (MONITOR)" if hours_to_tca <= 72 else "GREEN: > 72h (PLAN)")
     val = format_countdown(delta)
 
     st.markdown(
         f"""
-        <div style="
-            padding: 18px;
-            border-radius: 14px;
-            border: 1px solid rgba(255,255,255,0.15);
-            background: rgba(0,0,0,0.03);
-            ">
-            <div style="font-size: 14px; opacity: 0.8;">⏱️ Time to Closest Approach (TCA)</div>
-            <div style="font-size: 34px; font-weight: 800; color: {color}; margin-top: 6px;">{val}</div>
-            <div style="font-size: 13px; margin-top: 4px;">{label}</div>
-            <div style="font-size: 12px; opacity: 0.7; margin-top: 6px;">TCA: {tca_dt.strftime("%Y-%m-%d %H:%M:%S")}</div>
+        <div style="padding:18px;border-radius:14px;border:1px solid rgba(255,255,255,0.15);background:rgba(0,0,0,0.03);">
+          <div style="font-size:14px;opacity:0.8;">⏱️ Time to Closest Approach (TCA)</div>
+          <div style="font-size:34px;font-weight:800;color:{color};margin-top:6px;">{val}</div>
+          <div style="font-size:13px;margin-top:4px;">{label}</div>
+          <div style="font-size:12px;opacity:0.7;margin-top:6px;">TCA: {tca_dt.strftime("%Y-%m-%d %H:%M:%S")}</div>
         </div>
         """,
         unsafe_allow_html=True
@@ -195,105 +207,116 @@ def default_cov(km_sigma=0.2):
     return np.diag([s2, s2, s2])
 
 def build_event_labels(df: pd.DataFrame) -> pd.Series:
-    """
-    Creates a human-friendly event label for each row (no extra user inputs).
-    Tries common columns, otherwise falls back to index.
-    """
-    cols = set([c.lower() for c in df.columns])
+    cols_lower = {c.lower(): c for c in df.columns}
 
-    # Try best columns if present
-    if "event_id" in cols:
-        c = [x for x in df.columns if x.lower() == "event_id"][0]
+    if "event_id" in cols_lower:
+        c = cols_lower["event_id"]
         return df[c].astype(str)
 
-    # Satellite IDs if present
-    sat_a_candidates = ["sat_a", "satellite_a", "primary_sat", "sat1", "object1", "norad_a"]
-    sat_b_candidates = ["sat_b", "satellite_b", "secondary_sat", "sat2", "object2", "norad_b"]
-    tca_candidates = ["tca", "tca_time", "tca_datetime", "time_of_closest_approach"]
+    sat_a_candidates = {"sat_a", "satellite_a", "primary_sat", "sat1", "object1", "norad_a"}
+    sat_b_candidates = {"sat_b", "satellite_b", "secondary_sat", "sat2", "object2", "norad_b"}
+    tca_candidates = {"tca", "tca_time", "tca_datetime", "time_of_closest_approach"}
 
-    sat_a = next((c for c in df.columns if c.lower() in sat_a_candidates), None)
-    sat_b = next((c for c in df.columns if c.lower() in sat_b_candidates), None)
-    tca_c = next((c for c in df.columns if c.lower() in tca_candidates), None)
+    sat_a = next((cols_lower[k] for k in sat_a_candidates if k in cols_lower), None)
+    sat_b = next((cols_lower[k] for k in sat_b_candidates if k in cols_lower), None)
+    tca_c = next((cols_lower[k] for k in tca_candidates if k in cols_lower), None)
 
     if sat_a and sat_b and tca_c:
         return (df[sat_a].astype(str) + " vs " + df[sat_b].astype(str) + " @ " + df[tca_c].astype(str))
-
     if sat_a and sat_b:
         return (df[sat_a].astype(str) + " vs " + df[sat_b].astype(str))
 
-    # fallback
     return pd.Series([f"Event #{i}" for i in range(len(df))], index=df.index)
 
-def action_recommendation(prob: float | None, hours_to_tca: float) -> str:
-    # If no probability, recommend based on time only
-    if prob is None:
-        if hours_to_tca < 24:
-            return "🔴 **DECIDE NOW:** Request urgent update + prepare maneuver."
-        if hours_to_tca <= 72:
-            return "🟡 **MONITOR:** Track updates, pre-plan maneuver options."
-        return "🟢 **PLAN:** Normal monitoring, plan if trend worsens."
+def choose_alert_kind(kind_available: str) -> str:
+    if alert_mode.startswith("Probability"):
+        return "proba"
+    if alert_mode.startswith("Score"):
+        return "score"
+    # Auto:
+    if kind_available == "proba":
+        return "proba"
+    if kind_available == "score":
+        return "score"
+    return "pred"
 
-    # With probability + time
-    if hours_to_tca < 24:
-        return "🔴 **DECIDE NOW:** Execute/approve maneuver if risk remains high."
-    if hours_to_tca <= 72:
-        return "🟡 **MONITOR:** Refine OD, coordinate, prepare maneuver plan."
-    return "🟢 **PLAN:** Routine monitoring, schedule updates."
-
-def kpi_badge(prob: float | None, threshold: float):
-    if prob is None:
-        st.info("Model probability not available (no predict_proba). Showing class/score only.")
-        return
-    if prob >= threshold:
-        st.error(f"⚠️ ALERT: Risk probability {prob:.3f} ≥ threshold {threshold:.2f}")
+def show_alert(kind: str, value: float | None):
+    if kind == "proba":
+        if value is None:
+            st.info("Probability not available.")
+            return
+        if value >= prob_threshold:
+            st.error(f"⚠️ ALERT: Probability {value:.3f} ≥ {prob_threshold:.2f}")
+        else:
+            st.success(f"✅ OK: Probability {value:.3f} < {prob_threshold:.2f}")
+    elif kind == "score":
+        if value is None:
+            st.info("Score not available.")
+            return
+        if value >= score_threshold:
+            st.error(f"⚠️ ALERT: Score {value:.3f} ≥ {score_threshold:.2f}")
+        else:
+            st.success(f"✅ OK: Score {value:.3f} < {score_threshold:.2f}")
     else:
-        st.success(f"✅ OK: Risk probability {prob:.3f} < threshold {threshold:.2f}")
+        st.info("Model provides predictions only (no probability/score).")
+
+def operator_recommendation(hours_to_tca: float) -> str:
+    if hours_to_tca < 24:
+        return "🔴 **DECIDE NOW:** Request urgent tracking update + prepare/execute maneuver if needed."
+    if hours_to_tca <= 72:
+        return "🟡 **MONITOR:** Continue monitoring, coordinate, and pre-plan maneuver options."
+    return "🟢 **PLAN:** Normal monitoring and planning."
 
 # ==========================================================
 # Session state for scenario saving
 # ==========================================================
 if "scenarios" not in st.session_state:
-    st.session_state.scenarios = []  # list of dicts
+    st.session_state.scenarios = []
 
 # ==========================================================
 # Load Dataset
 # ==========================================================
 df = None
 if use_uploader:
-    uploaded = st.file_uploader("Upload a CSV file for prediction", type=["csv"])
-    if uploaded is not None:
-        df = pd.read_csv(uploaded)
+    up = st.file_uploader("Upload a CSV file for prediction", type=["csv"])
+    if up is not None:
+        df = pd.read_csv(up)
 else:
-    if Path(DATA_FILE).exists():
-        df = load_csv(DATA_FILE)
+    if not Path(DATA_FILE).exists():
+        st.error(f"Dataset file not found: `{DATA_FILE}`. Upload it to repo or correct in sidebar.")
+        st.stop()
+    df = load_csv(DATA_FILE)
 
 if df is None:
-    st.warning("Upload a CSV (or disable uploader and ensure combined_data.csv exists in repo).")
+    st.warning("Upload a CSV (or disable uploader and ensure the repo CSV exists).")
     st.stop()
 
 # ==========================================================
 # Load Model + Feature Map
 # ==========================================================
 if not Path(MODEL_FILE).exists():
-    st.error(f"Model file not found: `{MODEL_FILE}`. Upload it to the repo root or correct the name in sidebar.")
+    st.error(f"Model file not found: `{MODEL_FILE}`. Upload it to repo or correct in sidebar.")
     st.stop()
 
 try:
     model = load_model(MODEL_FILE)
 except Exception as e:
     st.error(f"Failed to load model: {e}")
-    st.info("Fix: add required libraries to requirements.txt (e.g., scikit-learn).")
+    st.info("Fix: add required libs to requirements.txt (e.g., scikit-learn).")
     st.stop()
 
 feature_map = {}
 if FEATURE_MAP_FILE and Path(FEATURE_MAP_FILE).exists():
     try:
         feature_map = load_feature_map(FEATURE_MAP_FILE)
+        st.sidebar.success("Feature map loaded ✅")
     except Exception as e:
-        st.warning(f"⚠️ Found `{FEATURE_MAP_FILE}` but failed to load: {e}")
+        st.sidebar.warning(f"Feature map failed: {e}")
+else:
+    st.sidebar.info("No feature_map.csv found (UI will show feature_0...).")
 
 # ==========================================================
-# Build event labels + selector
+# Event selector
 # ==========================================================
 event_labels = build_event_labels(df)
 label_to_index = {lbl: idx for lbl, idx in zip(event_labels.tolist(), df.index.tolist())}
@@ -305,13 +328,13 @@ row_idx = label_to_index[selected_label]
 row = df.loc[row_idx]
 
 # ==========================================================
-# Countdown header (C)
+# Header: Countdown (C)
 # ==========================================================
 st.header("⏱️ TCA Countdown")
 make_countdown_card(tca_dt)
 
 # ==========================================================
-# Tabs (better UX)
+# Tabs
 # ==========================================================
 tab_dataset, tab_prediction, tab_maneuver, tab_reports = st.tabs(
     ["📊 Dataset", "🚀 Prediction", "🧭 Maneuver + Uncertainty", "🧾 Reports"]
@@ -323,36 +346,32 @@ tab_dataset, tab_prediction, tab_maneuver, tab_reports = st.tabs(
 with tab_dataset:
     st.subheader("Dataset Overview")
     st.write("**Shape:**", df.shape)
+    st.write("**Selected Event:**", selected_label)
 
     display_df = rename_for_display(df, feature_map)
+    with st.expander("Preview (Original Names if mapping exists)", expanded=True):
+        st.dataframe(display_df.head(50), use_container_width=True)
 
-    left, right = st.columns([2, 1])
-    with left:
-        with st.expander("Preview (Original Names if mapping exists)", expanded=True):
-            st.dataframe(display_df.head(50), use_container_width=True)
-    with right:
-        st.write("**Selected Event:**", selected_label)
-        st.write("**Row index:**", row_idx)
-
-    # Distribution of probabilities if available
+    # Distribution of model output
     X_all = df.drop(columns=[TARGET_COL], errors="ignore")
     X_all = safe_numeric(X_all)
     X_all_aligned = align_features_for_model(model, X_all)
-    probs_all = get_probabilities(model, X_all_aligned)
 
-    if probs_all is not None:
+    kind_all, values_all = get_risk_output(model, X_all_aligned)
+    chosen_kind = choose_alert_kind(kind_all)
+
+    if chosen_kind == "proba" and kind_all == "proba":
         st.subheader("Risk Probability Distribution")
-        fig_hist = go.Figure()
-        fig_hist.add_trace(go.Histogram(x=probs_all, nbinsx=30, name="Risk Probability"))
-        fig_hist.update_layout(
-            height=320,
-            xaxis_title="Risk Probability",
-            yaxis_title="Count",
-            bargap=0.05
-        )
-        st.plotly_chart(fig_hist, use_container_width=True)
+        fig = go.Figure(data=[go.Histogram(x=values_all, nbinsx=30)])
+        fig.update_layout(height=320, xaxis_title="Probability", yaxis_title="Count", bargap=0.05)
+        st.plotly_chart(fig, use_container_width=True)
+    elif chosen_kind == "score" and kind_all == "score":
+        st.subheader("Risk Score Distribution (decision_function)")
+        fig = go.Figure(data=[go.Histogram(x=values_all, nbinsx=30)])
+        fig.update_layout(height=320, xaxis_title="Score", yaxis_title="Count", bargap=0.05)
+        st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("Probability distribution not available (model has no predict_proba).")
+        st.info("Distribution plot not available for the selected alert mode (model may not provide probability/score).")
 
 # ==========================================================
 # TAB 2: Prediction
@@ -360,52 +379,46 @@ with tab_dataset:
 with tab_prediction:
     st.subheader("Prediction for Selected Event")
 
-    # Build single-row X for selected event
     single_df = pd.DataFrame([row])
     X1 = single_df.drop(columns=[TARGET_COL], errors="ignore")
     X1 = safe_numeric(X1)
     X1_aligned = align_features_for_model(model, X1)
 
-    # Predict class/value
-    pred = None
-    prob = None
+    kind1, values1 = get_risk_output(model, X1_aligned)
+    chosen_kind = choose_alert_kind(kind1)
+
+    pred_value = None
     try:
-        pred = model.predict(X1_aligned)[0]
-    except Exception as e:
-        st.error(f"Prediction failed: {e}")
-        st.stop()
+        pred_value = model.predict(X1_aligned)[0]
+    except Exception:
+        pred_value = values1[0] if len(values1) else None
 
-    probs = get_probabilities(model, X1_aligned)
-    if probs is not None:
-        prob = float(probs[0])
-
-    # KPIs
     hours_to_tca = (tca_dt - datetime.now()).total_seconds() / 3600.0
+
     c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Predicted Risk (class/value)", f"{pred_value}")
+    c2.metric("Alert Mode", chosen_kind.upper())
+    c3.metric("Hours to TCA", f"{hours_to_tca:.1f}")
+    c4.metric("Selected Event", selected_label)
 
-    with c1:
-        st.metric("Predicted Risk (class/value)", f"{pred}")
-    with c2:
-        st.metric("Risk Probability", "N/A" if prob is None else f"{prob:.3f}")
-    with c3:
-        st.metric("Hours to TCA", f"{hours_to_tca:.1f}")
-    with c4:
-        st.metric("Alert Threshold", f"{risk_threshold:.2f}")
+    # Alert display
+    alert_val = None
+    if chosen_kind == "proba" and kind1 == "proba":
+        alert_val = float(values1[0])
+    elif chosen_kind == "score" and kind1 == "score":
+        alert_val = float(values1[0])
 
-    kpi_badge(prob, risk_threshold)
+    show_alert(chosen_kind, alert_val)
 
-    st.markdown("### Operator Recommendation")
-    st.write(action_recommendation(prob, hours_to_tca))
+    st.markdown("### Operator Recommendation (time-based)")
+    st.write(operator_recommendation(hours_to_tca))
 
     st.markdown("### Selected Event Data (display)")
     st.dataframe(rename_for_display(single_df, feature_map), use_container_width=True)
 
-    # Model expected features table
     if hasattr(model, "feature_names_in_"):
         expected = list(model.feature_names_in_)
-        exp_table = pd.DataFrame(
-            {"Model Feature": expected, "Original Name": [feature_map.get(c, c) for c in expected]}
-        )
+        exp_table = pd.DataFrame({"Model Feature": expected, "Original Name": [feature_map.get(c, c) for c in expected]})
         with st.expander("Model expected features (Original Names)", expanded=False):
             st.dataframe(exp_table, use_container_width=True)
 
@@ -416,10 +429,9 @@ with tab_maneuver:
     st.subheader("Maneuver Simulator + Error Ellipsoids (3D)")
     st.caption(
         "This uses a **simple linear relative-motion demo** around TCA: r(t)=r0+v0*t. "
-        "Your ML model prediction is computed from the dataset features; the maneuver plot is a separate visualization."
+        "Your ML model prediction is computed from dataset features; the maneuver plot is a separate visualization."
     )
 
-    # Allow mapping to real columns if present
     cols = list(df.columns)
     state_cols_default = {
         "rx": "rel_x_km",
@@ -442,17 +454,16 @@ with tab_maneuver:
 
         cc1, cc2 = st.columns(2)
         with cc1:
-            rx_col = pick_col("Relative X (km) column", state_cols_default["rx"])
-            ry_col = pick_col("Relative Y (km) column", state_cols_default["ry"])
-            rz_col = pick_col("Relative Z (km) column", state_cols_default["rz"])
+            rx_col = pick_col("Relative X (km)", state_cols_default["rx"])
+            ry_col = pick_col("Relative Y (km)", state_cols_default["ry"])
+            rz_col = pick_col("Relative Z (km)", state_cols_default["rz"])
         with cc2:
-            vx_col = pick_col("Relative Vx (km/s) column", state_cols_default["vx"])
-            vy_col = pick_col("Relative Vy (km/s) column", state_cols_default["vy"])
-            vz_col = pick_col("Relative Vz (km/s) column", state_cols_default["vz"])
+            vx_col = pick_col("Relative Vx (km/s)", state_cols_default["vx"])
+            vy_col = pick_col("Relative Vy (km/s)", state_cols_default["vy"])
+            vz_col = pick_col("Relative Vz (km/s)", state_cols_default["vz"])
 
-    # Demo fallback state (km, km/s)
-    r0_demo = np.array([0.3, 0.2, 0.05])        # 300m, 200m, 50m
-    v0_demo = np.array([-0.0006, 0.0004, 0.0])  # km/s (0.6 m/s, 0.4 m/s)
+    r0_demo = np.array([0.3, 0.2, 0.05])
+    v0_demo = np.array([-0.0006, 0.0004, 0.0])
 
     def get_state_from_row(r):
         try:
@@ -469,11 +480,11 @@ with tab_maneuver:
 
     span_hours = st.slider("Time window around TCA (hours)", 0.5, 12.0, 2.0, 0.5)
     N = 160
-    t = np.linspace(-span_hours * 3600, span_hours * 3600, N)  # seconds
+    t = np.linspace(-span_hours * 3600, span_hours * 3600, N)
 
     r_nom = propagate_relative_motion(r0_km, v0_kms, t)
 
-    dv_kms = delta_v / 1000.0  # m/s -> km/s
+    dv_kms = delta_v / 1000.0
     v_man = apply_delta_v(v0_kms, dv_kms, burn_direction)
     r_man = propagate_relative_motion(r0_km, v_man, t)
 
@@ -490,7 +501,6 @@ with tab_maneuver:
     k3.metric("Increase", f"{(md_man - md_nom) * 1000:.1f} m")
     k4.metric("ΔV", f"{delta_v:.2f} m/s")
 
-    # Uncertainty ellipsoids
     cov1 = default_cov(km_sigma=0.2)
     cov2 = default_cov(km_sigma=0.2)
 
@@ -540,8 +550,6 @@ with tab_maneuver:
     # Save scenario
     st.divider()
     st.subheader("Save Scenario")
-    st.caption("This saves maneuver parameters + miss distance results for comparison (visual simulator).")
-
     scenario_name = st.text_input("Scenario name", value=f"{selected_label} | ΔV {delta_v:.2f} m/s")
     if st.button("💾 Save current scenario"):
         st.session_state.scenarios.append({
@@ -573,7 +581,6 @@ with tab_reports:
         report_df = pd.DataFrame(st.session_state.scenarios)
         st.dataframe(report_df, use_container_width=True)
 
-        # Quick best scenario per event (max increase)
         st.markdown("### Best Scenario (by miss distance increase) per event")
         best = report_df.sort_values("increase_m", ascending=False).groupby("event", as_index=False).head(1)
         st.dataframe(best, use_container_width=True)
@@ -588,3 +595,13 @@ with tab_reports:
         if st.button("🧹 Clear all saved scenarios"):
             st.session_state.scenarios = []
             st.success("Cleared ✅")
+
+# ==========================================================
+# Footer debug
+# ==========================================================
+if show_debug:
+    st.divider()
+    st.subheader("Debug Info")
+    st.write("Model type:", type(model))
+    st.write("Has predict_proba:", hasattr(model, "predict_proba"))
+    st.write("Has decision_function:", hasattr(model, "decision_function"))
