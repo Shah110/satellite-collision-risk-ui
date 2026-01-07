@@ -33,6 +33,11 @@ use_uploader = st.sidebar.toggle("Use CSV uploader instead of repo file", value=
 show_debug = st.sidebar.toggle("Show debug info", value=False)
 
 st.sidebar.divider()
+st.sidebar.subheader("🧾 Feature Name Display")
+FEATURE_MAP_FILE = st.sidebar.text_input("Feature map file (optional)", value="feature_map.csv")
+st.sidebar.caption("feature_map.csv must have columns: model_feature, original_feature")
+
+st.sidebar.divider()
 st.sidebar.subheader("🛰️ Conjunction Ops Controls")
 
 # --- Delta-V slider
@@ -47,11 +52,6 @@ now_local = datetime.now()
 tca_date = st.sidebar.date_input("TCA date", value=now_local.date())
 tca_time = st.sidebar.time_input("TCA time", value=(now_local + timedelta(hours=48)).time())
 tca_dt = datetime.combine(tca_date, tca_time)
-
-st.sidebar.divider()
-st.sidebar.subheader("🧾 Feature Name Display")
-FEATURE_MAP_FILE = st.sidebar.text_input("Feature map file (optional)", value="feature_map.csv")
-st.sidebar.caption("Create feature_map.csv with columns: model_feature, original_feature")
 
 # ==========================================================
 # Helpers
@@ -71,12 +71,6 @@ def load_feature_map(path: str) -> dict:
         raise ValueError("feature_map.csv must contain columns: model_feature, original_feature")
     return dict(zip(fm["model_feature"].astype(str), fm["original_feature"].astype(str)))
 
-def display_name(col: str, fmap: dict) -> str:
-    return fmap.get(str(col), str(col))
-
-def display_names(cols, fmap: dict):
-    return [display_name(c, fmap) for c in cols]
-
 def safe_numeric(df: pd.DataFrame) -> pd.DataFrame:
     X = df.copy()
     for c in X.columns:
@@ -88,6 +82,19 @@ def align_features_for_model(model, X: pd.DataFrame) -> pd.DataFrame:
         expected = list(model.feature_names_in_)
         return X.reindex(columns=expected, fill_value=0)
     return X
+
+# ---------------------------
+# ✅ One-shot DISPLAY rename
+# ---------------------------
+def rename_for_display(df_in: pd.DataFrame, fmap: dict) -> pd.DataFrame:
+    """
+    Renames columns ONLY for UI display (does NOT affect model input).
+    fmap format: { 'feature_0': 'real_name', ... }
+    """
+    if not fmap:
+        return df_in
+    rename_dict = {k: v for k, v in fmap.items() if k in df_in.columns}
+    return df_in.rename(columns=rename_dict)
 
 def format_countdown(delta: timedelta) -> str:
     total = int(delta.total_seconds())
@@ -104,10 +111,10 @@ def format_countdown(delta: timedelta) -> str:
 
 def countdown_color(hours_to_tca: float) -> str:
     if hours_to_tca < 24:
-        return "#ff4d4f"  # red
+        return "#ff4d4f"
     if 24 <= hours_to_tca <= 72:
-        return "#faad14"  # yellow
-    return "#52c41a"      # green
+        return "#faad14"
+    return "#52c41a"
 
 def make_countdown_card(tca_dt: datetime):
     now = datetime.now()
@@ -201,12 +208,8 @@ else:
 if df is None:
     st.stop()
 
-st.write("**Shape:**", df.shape)
-with st.expander("Show dataset preview", expanded=True):
-    st.dataframe(df.head(30), use_container_width=True)
-
 # ==========================================================
-# Load Model + Feature Mapping
+# Load Model + Feature Map
 # ==========================================================
 st.header("🧩 Model")
 
@@ -229,18 +232,24 @@ if FEATURE_MAP_FILE and Path(FEATURE_MAP_FILE).exists():
     except Exception as e:
         st.warning(f"⚠️ Found `{FEATURE_MAP_FILE}` but failed to load: {e}")
 else:
-    st.warning("ℹ️ No feature_map.csv found. UI will show model feature names (feature_0...).")
+    st.warning("ℹ️ No feature_map.csv found. UI will show feature_0... names.")
 
+# ✅ One-shot: create display_df (UI only)
+display_df = rename_for_display(df, feature_map)
+
+st.write("**Shape:**", df.shape)
+with st.expander("Show dataset preview (Original Names)", expanded=True):
+    st.dataframe(display_df.head(30), use_container_width=True)
+
+# Show expected model features with original names
 if hasattr(model, "feature_names_in_"):
     expected = list(model.feature_names_in_)
+    exp_table = pd.DataFrame({
+        "Model Feature": expected,
+        "Original Name": [feature_map.get(c, c) for c in expected]
+    })
     with st.expander("Model expected features (Original Names)", expanded=False):
-        st.dataframe(
-            pd.DataFrame({
-                "Model Feature": expected,
-                "Original Name": display_names(expected, feature_map)
-            }),
-            use_container_width=True
-        )
+        st.dataframe(exp_table, use_container_width=True)
 
 # ==========================================================
 # Prediction Panel
@@ -264,9 +273,9 @@ m2.metric("Missing vs model", len(missing_cols))
 m3.metric("Extra vs model", len(extra_cols))
 
 if missing_cols:
-    st.warning(f"Missing columns (filled with 0) (up to 25): {display_names(missing_cols, feature_map)[:25]}")
+    st.warning(f"Missing columns (filled with 0): {[feature_map.get(c, c) for c in missing_cols[:25]]}")
 if extra_cols:
-    st.info(f"Extra columns ignored (up to 25): {display_names(extra_cols, feature_map)[:25]}")
+    st.info(f"Extra columns ignored: {[feature_map.get(c, c) for c in extra_cols[:25]]}")
 
 predict = st.button("🧠 Predict Collision Risk", type="primary")
 if predict:
@@ -274,12 +283,16 @@ if predict:
         preds = model.predict(X_aligned)
         out = df.copy()
         out["predicted_risk"] = preds
+
+        # ✅ display version (UI only)
+        display_out = rename_for_display(out, feature_map)
+
         st.success("Predictions generated ✅")
-        st.dataframe(out.head(50), use_container_width=True)
+        st.dataframe(display_out.head(50), use_container_width=True)
 
         st.download_button(
             "⬇️ Download Predictions CSV",
-            out.to_csv(index=False).encode("utf-8"),
+            out.to_csv(index=False).encode("utf-8"),  # keep raw for compatibility
             file_name="collision_risk_predictions.csv",
             mime="text/csv",
         )
@@ -309,7 +322,7 @@ state_cols_default = {
 }
 
 with st.expander("State configuration (optional)", expanded=False):
-    st.write("Pick relative state columns if they exist in your CSV (we will show original names too).")
+    st.write("Pick relative state columns if they exist in your CSV.")
 
     def pick_col(label, default_name):
         candidates = [c for c in cols if c.lower() == default_name.lower()]
