@@ -42,12 +42,13 @@ st.sidebar.subheader("🚨 Alert Threshold")
 
 alert_mode = st.sidebar.radio(
     "Alert based on:",
-    ["Auto (Probability if available, else Score)", "Probability", "Score"],
+    ["Auto (Probability if available, else Score, else Pred)", "Probability", "Score", "Predicted value"],
     index=0
 )
 
 prob_threshold = st.sidebar.slider("Probability threshold", 0.0, 1.0, 0.50, 0.01)
 score_threshold = st.sidebar.number_input("Score threshold (decision_function)", value=0.0, step=0.1)
+pred_threshold = st.sidebar.slider("Predicted value threshold", 0.0, 1.0, 0.50, 0.01)
 
 st.sidebar.divider()
 st.sidebar.subheader("🛰️ Conjunction Ops Controls")
@@ -117,7 +118,7 @@ def get_risk_output(model, X_aligned: pd.DataFrame):
         except Exception:
             pass
 
-    # Score (SVM/linear models)
+    # Score
     if hasattr(model, "decision_function"):
         try:
             s = model.decision_function(X_aligned)
@@ -126,7 +127,7 @@ def get_risk_output(model, X_aligned: pd.DataFrame):
         except Exception:
             pass
 
-    # Fallback prediction
+    # Prediction fallback
     y = model.predict(X_aligned)
     return "pred", np.asarray(y).reshape(-1)
 
@@ -208,24 +209,8 @@ def default_cov(km_sigma=0.2):
 
 def build_event_labels(df: pd.DataFrame) -> pd.Series:
     cols_lower = {c.lower(): c for c in df.columns}
-
     if "event_id" in cols_lower:
-        c = cols_lower["event_id"]
-        return df[c].astype(str)
-
-    sat_a_candidates = {"sat_a", "satellite_a", "primary_sat", "sat1", "object1", "norad_a"}
-    sat_b_candidates = {"sat_b", "satellite_b", "secondary_sat", "sat2", "object2", "norad_b"}
-    tca_candidates = {"tca", "tca_time", "tca_datetime", "time_of_closest_approach"}
-
-    sat_a = next((cols_lower[k] for k in sat_a_candidates if k in cols_lower), None)
-    sat_b = next((cols_lower[k] for k in sat_b_candidates if k in cols_lower), None)
-    tca_c = next((cols_lower[k] for k in tca_candidates if k in cols_lower), None)
-
-    if sat_a and sat_b and tca_c:
-        return (df[sat_a].astype(str) + " vs " + df[sat_b].astype(str) + " @ " + df[tca_c].astype(str))
-    if sat_a and sat_b:
-        return (df[sat_a].astype(str) + " vs " + df[sat_b].astype(str))
-
+        return df[cols_lower["event_id"]].astype(str)
     return pd.Series([f"Event #{i}" for i in range(len(df))], index=df.index)
 
 def choose_alert_kind(kind_available: str) -> str:
@@ -233,6 +218,8 @@ def choose_alert_kind(kind_available: str) -> str:
         return "proba"
     if alert_mode.startswith("Score"):
         return "score"
+    if alert_mode.startswith("Predicted"):
+        return "pred"
     # Auto:
     if kind_available == "proba":
         return "proba"
@@ -241,24 +228,27 @@ def choose_alert_kind(kind_available: str) -> str:
     return "pred"
 
 def show_alert(kind: str, value: float | None):
+    if value is None:
+        st.info("Alert value not available.")
+        return
+
     if kind == "proba":
-        if value is None:
-            st.info("Probability not available.")
-            return
         if value >= prob_threshold:
             st.error(f"⚠️ ALERT: Probability {value:.3f} ≥ {prob_threshold:.2f}")
         else:
             st.success(f"✅ OK: Probability {value:.3f} < {prob_threshold:.2f}")
+
     elif kind == "score":
-        if value is None:
-            st.info("Score not available.")
-            return
         if value >= score_threshold:
             st.error(f"⚠️ ALERT: Score {value:.3f} ≥ {score_threshold:.2f}")
         else:
             st.success(f"✅ OK: Score {value:.3f} < {score_threshold:.2f}")
-    else:
-        st.info("Model provides predictions only (no probability/score).")
+
+    else:  # pred
+        if value >= pred_threshold:
+            st.error(f"⚠️ ALERT: Predicted value {value:.3f} ≥ {pred_threshold:.2f}")
+        else:
+            st.success(f"✅ OK: Predicted value {value:.3f} < {pred_threshold:.2f}")
 
 def operator_recommendation(hours_to_tca: float) -> str:
     if hours_to_tca < 24:
@@ -352,26 +342,30 @@ with tab_dataset:
     with st.expander("Preview (Original Names if mapping exists)", expanded=True):
         st.dataframe(display_df.head(50), use_container_width=True)
 
-    # Distribution of model output
+    # Always show a distribution plot (proba -> score -> pred)
     X_all = df.drop(columns=[TARGET_COL], errors="ignore")
     X_all = safe_numeric(X_all)
     X_all_aligned = align_features_for_model(model, X_all)
-
     kind_all, values_all = get_risk_output(model, X_all_aligned)
-    chosen_kind = choose_alert_kind(kind_all)
 
-    if chosen_kind == "proba" and kind_all == "proba":
+    if kind_all == "proba":
         st.subheader("Risk Probability Distribution")
         fig = go.Figure(data=[go.Histogram(x=values_all, nbinsx=30)])
         fig.update_layout(height=320, xaxis_title="Probability", yaxis_title="Count", bargap=0.05)
         st.plotly_chart(fig, use_container_width=True)
-    elif chosen_kind == "score" and kind_all == "score":
+
+    elif kind_all == "score":
         st.subheader("Risk Score Distribution (decision_function)")
         fig = go.Figure(data=[go.Histogram(x=values_all, nbinsx=30)])
         fig.update_layout(height=320, xaxis_title="Score", yaxis_title="Count", bargap=0.05)
         st.plotly_chart(fig, use_container_width=True)
+
     else:
-        st.info("Distribution plot not available for the selected alert mode (model may not provide probability/score).")
+        st.subheader("Predicted Risk Distribution (predict output)")
+        fig = go.Figure(data=[go.Histogram(x=values_all, nbinsx=30)])
+        fig.update_layout(height=320, xaxis_title="Predicted value", yaxis_title="Count", bargap=0.05)
+        st.plotly_chart(fig, use_container_width=True)
+        st.info("Note: Your model does not provide probabilities/scores, so we are plotting predicted values.")
 
 # ==========================================================
 # TAB 2: Prediction
@@ -387,26 +381,25 @@ with tab_prediction:
     kind1, values1 = get_risk_output(model, X1_aligned)
     chosen_kind = choose_alert_kind(kind1)
 
-    pred_value = None
-    try:
-        pred_value = model.predict(X1_aligned)[0]
-    except Exception:
-        pred_value = values1[0] if len(values1) else None
+    pred_value = float(values1[0]) if len(values1) else None
 
     hours_to_tca = (tca_dt - datetime.now()).total_seconds() / 3600.0
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Predicted Risk (class/value)", f"{pred_value}")
+    c1.metric("Predicted Risk (value)", "N/A" if pred_value is None else f"{pred_value:.4f}")
     c2.metric("Alert Mode", chosen_kind.upper())
     c3.metric("Hours to TCA", f"{hours_to_tca:.1f}")
     c4.metric("Selected Event", selected_label)
 
-    # Alert display
+    # Alert value depends on chosen kind
     alert_val = None
     if chosen_kind == "proba" and kind1 == "proba":
         alert_val = float(values1[0])
     elif chosen_kind == "score" and kind1 == "score":
         alert_val = float(values1[0])
+    else:
+        # predicted value (always available)
+        alert_val = float(values1[0]) if len(values1) else None
 
     show_alert(chosen_kind, alert_val)
 
@@ -429,7 +422,7 @@ with tab_maneuver:
     st.subheader("Maneuver Simulator + Error Ellipsoids (3D)")
     st.caption(
         "This uses a **simple linear relative-motion demo** around TCA: r(t)=r0+v0*t. "
-        "Your ML model prediction is computed from dataset features; the maneuver plot is a separate visualization."
+        "The ML prediction uses dataset features; this maneuver plot is a visualization."
     )
 
     cols = list(df.columns)
@@ -547,7 +540,6 @@ with tab_maneuver:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # Save scenario
     st.divider()
     st.subheader("Save Scenario")
     scenario_name = st.text_input("Scenario name", value=f"{selected_label} | ΔV {delta_v:.2f} m/s")
@@ -563,11 +555,6 @@ with tab_maneuver:
             "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
         st.success("Scenario saved ✅")
-
-    if show_debug:
-        st.write("DEBUG r0_km:", r0_km)
-        st.write("DEBUG v0_kms:", v0_kms)
-        st.write("DEBUG v_man_kms:", v_man)
 
 # ==========================================================
 # TAB 4: Reports
