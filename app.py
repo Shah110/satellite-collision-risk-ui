@@ -332,8 +332,8 @@ row = df.loc[row_idx]
 # ==========================================================
 # Countdown
 # ==========================================================
-st.header("⏱️ TCA Countdown")
-make_countdown_card(tca_dt)
+#st.header("⏱️ TCA Countdown")
+#make_countdown_card(tca_dt)
 
 # ==========================================================
 # Tabs
