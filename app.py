@@ -14,7 +14,7 @@ st.title("🛰️ Satellite Collision Risk UI")
 st.success("App is running ✅")
 
 # ==========================================================
-# Sidebar: Links + Global Settings
+# Sidebar: Links + Settings
 # ==========================================================
 st.sidebar.header("🚀 Project Notebooks (Colab)")
 st.sidebar.markdown(
@@ -29,25 +29,25 @@ DATA_FILE = st.sidebar.text_input("Dataset file in repo", value="cleaned_train_f
 MODEL_FILE = st.sidebar.text_input("Model file in repo", value="collision_risk_model.pkl")
 TARGET_COL = st.sidebar.text_input("Target column (if exists)", value="risk")
 
-use_uploader = st.sidebar.toggle("Use CSV uploader instead of repo file", value=True)
-show_debug = st.sidebar.toggle("Show debug info", value=False)
+use_uploader = st.sidebar.toggle("Use CSV uploader instead of repo file", value=False)
+show_debug = st.sidebar.toggle("Show debug panels", value=True)
 
 st.sidebar.divider()
-st.sidebar.subheader("🧾 Feature Name Display")
-FEATURE_MAP_FILE = st.sidebar.text_input("Feature map file (optional)", value="feature_map.csv")
-st.sidebar.caption("feature_map.csv must have columns: model_feature, original_feature")
+st.sidebar.subheader("🧾 Feature Mapping (IMPORTANT)")
+FEATURE_MAP_FILE = st.sidebar.text_input("feature_map.csv (recommended)", value="feature_map.csv")
+use_feature_map = st.sidebar.toggle("Use feature_map.csv to build model input", value=True)
+st.sidebar.caption("feature_map.csv columns: model_feature, original_feature")
 
 st.sidebar.divider()
-st.sidebar.subheader("🚨 Alert Threshold (Risk Score)")
-risk_threshold = st.sidebar.slider("Risk score threshold (0–1)", 0.0, 1.0, 0.50, 0.01)
-st.sidebar.caption("This is a score from model predictions (not a true probability unless your model supports it).")
+st.sidebar.subheader("🚨 Alert Threshold (Risk Score 0–1)")
+risk_threshold = st.sidebar.slider("Risk score threshold", 0.0, 1.0, 0.50, 0.01)
 
 st.sidebar.divider()
 st.sidebar.subheader("🛰️ Conjunction Ops Controls")
 delta_v = st.sidebar.slider("ΔV burn magnitude (m/s)", 0.0, 2.0, 0.0, 0.01)
 burn_direction = st.sidebar.selectbox(
     "ΔV direction (relative frame)",
-    ["Along-track (V direction)", "Radial (X)", "Cross-track (Z)"]
+    ["Along-track (V direction)", "Radial (X)", "Cross-track (Z)"],
 )
 
 now_local = datetime.now()
@@ -71,25 +71,27 @@ def load_feature_map(path: str) -> dict:
     fm = pd.read_csv(path)
     if not {"model_feature", "original_feature"}.issubset(fm.columns):
         raise ValueError("feature_map.csv must contain columns: model_feature, original_feature")
+    # dict: model_feature -> original_feature
     return dict(zip(fm["model_feature"].astype(str), fm["original_feature"].astype(str)))
 
-def safe_numeric(df: pd.DataFrame) -> pd.DataFrame:
+def safe_numeric_only(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep numeric columns only (coerce non-numeric to NaN then fill)."""
     X = df.copy()
     for c in X.columns:
-        X[c] = pd.to_numeric(X[c], errors="ignore")
+        X[c] = pd.to_numeric(X[c], errors="coerce")
     return X.select_dtypes(include=["number"]).fillna(0)
 
-def align_features_for_model(model, X: pd.DataFrame) -> pd.DataFrame:
-    if hasattr(model, "feature_names_in_"):
-        expected = list(model.feature_names_in_)
-        return X.reindex(columns=expected, fill_value=0)
-    return X
-
-def rename_for_display(df_in: pd.DataFrame, fmap: dict) -> pd.DataFrame:
-    if not fmap:
-        return df_in
-    rename_dict = {k: v for k, v in fmap.items() if k in df_in.columns}
-    return df_in.rename(columns=rename_dict)
+def normalize_0_1(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=float).reshape(-1)
+    if len(x) == 0:
+        return x
+    mn, mx = float(np.min(x)), float(np.max(x))
+    # already 0..1
+    if mn >= -1e-9 and mx <= 1.0 + 1e-9:
+        return np.clip(x, 0.0, 1.0)
+    if np.isclose(mx - mn, 0.0):
+        return np.zeros_like(x)
+    return (x - mn) / (mx - mn)
 
 def get_risk_output(model, X_aligned: pd.DataFrame):
     """
@@ -97,6 +99,7 @@ def get_risk_output(model, X_aligned: pd.DataFrame):
     kind: 'proba' | 'score' | 'pred'
     values: 1D array
     """
+    # probabilities
     if hasattr(model, "predict_proba"):
         try:
             p = np.asarray(model.predict_proba(X_aligned))
@@ -107,6 +110,7 @@ def get_risk_output(model, X_aligned: pd.DataFrame):
         except Exception:
             pass
 
+    # decision score
     if hasattr(model, "decision_function"):
         try:
             s = model.decision_function(X_aligned)
@@ -114,27 +118,9 @@ def get_risk_output(model, X_aligned: pd.DataFrame):
         except Exception:
             pass
 
+    # fallback prediction
     y = model.predict(X_aligned)
     return "pred", np.asarray(y).reshape(-1)
-
-def normalize_0_1(x: np.ndarray) -> np.ndarray:
-    """
-    Normalize array to [0,1] for UI score display.
-    If the model already outputs [0,1], it stays almost the same.
-    """
-    x = np.asarray(x, dtype=float).reshape(-1)
-    if len(x) == 0:
-        return x
-    mn, mx = float(np.min(x)), float(np.max(x))
-
-    # If already in [0,1] (allow small tolerance), keep as-is
-    if mn >= -1e-9 and mx <= 1.0 + 1e-9:
-        return np.clip(x, 0.0, 1.0)
-
-    # Otherwise normalize
-    if np.isclose(mx - mn, 0.0):
-        return np.zeros_like(x)
-    return (x - mn) / (mx - mn)
 
 def format_countdown(delta: timedelta) -> str:
     total = int(delta.total_seconds())
@@ -231,11 +217,85 @@ def show_risk_badge(score_0_1: float):
     else:
         st.success(f"✅ OK: Risk Score {score_0_1:.3f} < {risk_threshold:.2f}")
 
-# ==========================================================
-# Session state for scenario saving
-# ==========================================================
-if "scenarios" not in st.session_state:
-    st.session_state.scenarios = []
+def try_infer_mapping_by_numeric_order(df: pd.DataFrame, expected: list[str]) -> dict:
+    """
+    Last-resort: map expected model columns to the first N numeric columns in the CSV.
+    This is NOT scientifically correct unless your training used the same order.
+    """
+    numeric_cols = list(safe_numeric_only(df).columns)
+    n = min(len(expected), len(numeric_cols))
+    return {expected[i]: numeric_cols[i] for i in range(n)}
+
+def build_model_input(df: pd.DataFrame, model, fmap: dict | None):
+    """
+    Build X for the model:
+    1) If model.feature_names_in_ exists:
+       - If df already contains those columns -> align directly
+       - Else if fmap provided -> map original columns to model columns
+       - Else -> infer mapping by numeric order (warn)
+    2) If model has no feature_names_in_:
+       - Use numeric columns as-is
+    Returns: (X_aligned, debug_info_dict)
+    """
+    debug = {}
+    X_src = df.drop(columns=[TARGET_COL], errors="ignore")
+
+    if hasattr(model, "feature_names_in_"):
+        expected = list(model.feature_names_in_)
+        debug["expected_count"] = len(expected)
+        debug["expected"] = expected
+
+        # Case A: dataset already has expected model columns
+        if all(c in X_src.columns for c in expected):
+            Xnum = safe_numeric_only(X_src)
+            X_aligned = Xnum.reindex(columns=expected, fill_value=0)
+            debug["mode"] = "direct_match"
+            debug["missing"] = [c for c in expected if c not in Xnum.columns]
+            debug["extra"] = [c for c in Xnum.columns if c not in expected]
+            return X_aligned, debug
+
+        # Case B: use feature map (recommended)
+        if fmap:
+            X_out = pd.DataFrame(index=df.index)
+            missing_from_csv = []
+            for model_col in expected:
+                orig_col = fmap.get(model_col)
+                if orig_col is None:
+                    # mapping not provided for this expected model feature
+                    X_out[model_col] = 0.0
+                    missing_from_csv.append(f"(no map) {model_col}")
+                    continue
+                if orig_col not in X_src.columns:
+                    X_out[model_col] = 0.0
+                    missing_from_csv.append(orig_col)
+                else:
+                    X_out[model_col] = pd.to_numeric(X_src[orig_col], errors="coerce").fillna(0.0)
+
+            debug["mode"] = "feature_map"
+            debug["missing"] = missing_from_csv
+            debug["extra"] = [c for c in X_src.columns if c not in set(fmap.values())]
+            return X_out, debug
+
+        # Case C: infer mapping by numeric order (last resort)
+        inferred = try_infer_mapping_by_numeric_order(X_src, expected)
+        X_out = pd.DataFrame(index=df.index)
+        for model_col in expected:
+            orig_col = inferred.get(model_col)
+            if orig_col is None:
+                X_out[model_col] = 0.0
+            else:
+                X_out[model_col] = pd.to_numeric(X_src[orig_col], errors="coerce").fillna(0.0)
+
+        debug["mode"] = "inferred_numeric_order"
+        debug["inferred_map_preview"] = dict(list(inferred.items())[:10])
+        return X_out, debug
+
+    # No expected feature names known: just numeric
+    Xnum = safe_numeric_only(X_src)
+    debug["mode"] = "no_feature_names_in_model"
+    debug["provided_numeric_cols"] = list(Xnum.columns)
+    return Xnum, debug
+
 
 # ==========================================================
 # Load Dataset
@@ -256,7 +316,7 @@ if df is None:
     st.stop()
 
 # ==========================================================
-# Load Model + Feature Map
+# Load Model
 # ==========================================================
 if not Path(MODEL_FILE).exists():
     st.error(f"Model file not found: `{MODEL_FILE}`. Upload it to repo or correct in sidebar.")
@@ -266,18 +326,23 @@ try:
     model = load_model(MODEL_FILE)
 except Exception as e:
     st.error(f"Failed to load model: {e}")
-    st.info("Fix: add required libs to requirements.txt (e.g., scikit-learn).")
+    st.info("If you see 'No module named sklearn', add scikit-learn to requirements.txt and redeploy.")
     st.stop()
 
-feature_map = {}
-if FEATURE_MAP_FILE and Path(FEATURE_MAP_FILE).exists():
+# ==========================================================
+# Load Feature Map (optional but recommended)
+# ==========================================================
+feature_map = None
+if use_feature_map and FEATURE_MAP_FILE and Path(FEATURE_MAP_FILE).exists():
     try:
         feature_map = load_feature_map(FEATURE_MAP_FILE)
-        st.sidebar.success("Feature map loaded ✅")
+        st.sidebar.success("feature_map.csv loaded ✅")
     except Exception as e:
-        st.sidebar.warning(f"Feature map failed: {e}")
-else:
-    st.sidebar.info("No feature_map.csv found (UI will show feature_0...).")
+        st.sidebar.error(f"feature_map.csv error: {e}")
+        feature_map = None
+elif use_feature_map:
+    st.sidebar.warning("feature_map.csv not found. Predictions may become constant if your model expects feature_0..")
+    feature_map = None
 
 # ==========================================================
 # Event selector
@@ -292,7 +357,7 @@ row_idx = label_to_index[selected_label]
 row = df.loc[row_idx]
 
 # ==========================================================
-# Header: Countdown (C)
+# Countdown (TCA)
 # ==========================================================
 st.header("⏱️ TCA Countdown")
 make_countdown_card(tca_dt)
@@ -308,71 +373,99 @@ tab_dataset, tab_prediction, tab_maneuver, tab_reports = st.tabs(
 # TAB 1: Dataset
 # ==========================================================
 with tab_dataset:
-    st.subheader("Dataset Overview")
+    st.subheader("Dataset Preview")
+    st.write("**File:**", DATA_FILE if not use_uploader else "Uploaded CSV")
     st.write("**Shape:**", df.shape)
-    st.write("**Selected Event:**", selected_label)
+    with st.expander("Show dataset preview", expanded=True):
+        st.dataframe(df.head(50), use_container_width=True)
 
-    display_df = rename_for_display(df, feature_map)
-    with st.expander("Preview (Original Names if mapping exists)", expanded=True):
-        st.dataframe(display_df.head(50), use_container_width=True)
+    # Build model input for ALL rows
+    X_all_aligned, dbg_all = build_model_input(df, model, feature_map)
 
-    # Distribution always shown as a "Risk Score (0–1)"
-    X_all = df.drop(columns=[TARGET_COL], errors="ignore")
-    X_all = safe_numeric(X_all)
-    X_all_aligned = align_features_for_model(model, X_all)
-
+    # Run model output
     kind_all, values_all = get_risk_output(model, X_all_aligned)
+    values_all = np.asarray(values_all, dtype=float).reshape(-1)
     risk_all = normalize_0_1(values_all)
 
+    st.subheader("Risk Output Summary")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Model output type", kind_all)
+    c2.metric("Rows", f"{len(values_all):,}")
+    c3.metric("Unique raw outputs", f"{len(np.unique(values_all)):,}")
+    c4.metric("Std (raw)", f"{np.std(values_all):.6f}")
+
+    with st.expander("Describe (raw outputs)", expanded=False):
+        st.write(pd.Series(values_all).describe())
+
+    # Warn if output is almost constant
+    if len(np.unique(values_all)) <= 2 or np.isclose(np.std(values_all), 0.0):
+        st.warning(
+            "Your model outputs look almost constant across the dataset.\n\n"
+            "Most common cause: **feature mismatch** (inputs became all zeros because column names don't match).\n"
+            "Fix: provide a correct **feature_map.csv** mapping your real columns → model_feature (e.g., feature_0..)."
+        )
+
     st.subheader("Risk Score Distribution (0–1)")
-    fig = go.Figure(data=[go.Histogram(x=risk_all, nbinsx=30)])
-    fig.update_layout(height=320, xaxis_title="Risk Score (0–1)", yaxis_title="Count", bargap=0.05)
-    st.plotly_chart(fig, use_container_width=True)
+    if len(np.unique(risk_all)) == 1:
+        st.info(f"All risk scores are the same: **{float(risk_all[0]):.6f}**")
+    else:
+        nbins = 50 if len(risk_all) > 50000 else 30
+        fig = go.Figure(data=[go.Histogram(x=risk_all, nbinsx=nbins)])
+        fig.update_layout(height=360, xaxis_title="Risk Score (0–1)", yaxis_title="Count", bargap=0.05)
+        st.plotly_chart(fig, use_container_width=True)
 
     st.caption(
-        f"Model output type: **{kind_all}**. "
-        "Risk Score is normalized to 0–1 for visualization (not a true probability unless your model provides it)."
+        f"Input build mode: **{dbg_all.get('mode','?')}**. "
+        "Risk Score is normalized to 0–1 for visualization (not necessarily a true probability)."
     )
+
+    if show_debug:
+        with st.expander("Debug: Model input wiring", expanded=False):
+            st.write("Build mode:", dbg_all.get("mode"))
+            if "expected_count" in dbg_all:
+                st.write("Model expected features:", dbg_all["expected_count"])
+            if "missing" in dbg_all:
+                st.write("Missing (filled with 0) sample:", dbg_all["missing"][:30])
+            if "extra" in dbg_all:
+                st.write("Extra sample:", dbg_all["extra"][:30])
+            if "inferred_map_preview" in dbg_all:
+                st.write("Inferred mapping preview (first 10):", dbg_all["inferred_map_preview"])
+            st.write("X_all_aligned shape:", X_all_aligned.shape)
+            st.write("X_all_aligned head:", X_all_aligned.head())
 
 # ==========================================================
 # TAB 2: Prediction
 # ==========================================================
 with tab_prediction:
     st.subheader("Prediction for Selected Event")
-
     single_df = pd.DataFrame([row])
-    X1 = single_df.drop(columns=[TARGET_COL], errors="ignore")
-    X1 = safe_numeric(X1)
-    X1_aligned = align_features_for_model(model, X1)
 
+    X1_aligned, dbg1 = build_model_input(single_df, model, feature_map)
     kind1, values1 = get_risk_output(model, X1_aligned)
-    raw_value = float(values1[0]) if len(values1) else 0.0
+    raw_value = float(np.asarray(values1).reshape(-1)[0]) if len(values1) else 0.0
     risk_score = float(normalize_0_1(np.array([raw_value]))[0])
 
     hours_to_tca = (tca_dt - datetime.now()).total_seconds() / 3600.0
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Risk Score (0–1)", f"{risk_score:.3f}")
-    c2.metric("Raw Model Output", f"{raw_value:.4f}")
-    c3.metric("Model Output Type", kind1)
-    c4.metric("Hours to TCA", f"{hours_to_tca:.1f}")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Risk Score (0–1)", f"{risk_score:.3f}")
+    m2.metric("Raw Model Output", f"{raw_value:.4f}")
+    m3.metric("Output Type", kind1)
+    m4.metric("Hours to TCA", f"{hours_to_tca:.1f}")
 
     show_risk_badge(risk_score)
 
-    st.markdown("### Operator Recommendation (time-based)")
+    st.markdown("### Operator Recommendation")
     st.write(operator_recommendation(hours_to_tca))
 
-    st.markdown("### Selected Event Data (display)")
-    st.dataframe(rename_for_display(single_df, feature_map), use_container_width=True)
+    st.markdown("### Selected Event Row")
+    st.dataframe(single_df, use_container_width=True)
 
-    # Optional: show expected features
-    if hasattr(model, "feature_names_in_"):
-        expected = list(model.feature_names_in_)
-        exp_table = pd.DataFrame(
-            {"Model Feature": expected, "Original Name": [feature_map.get(c, c) for c in expected]}
-        )
-        with st.expander("Model expected features (Original Names)", expanded=False):
-            st.dataframe(exp_table, use_container_width=True)
+    if show_debug:
+        with st.expander("Debug: Selected Event wiring", expanded=False):
+            st.write("Build mode:", dbg1.get("mode"))
+            st.write("X1_aligned columns:", list(X1_aligned.columns))
+            st.write("X1_aligned values:", X1_aligned.iloc[0].to_dict())
 
 # ==========================================================
 # TAB 3: Maneuver + Uncertainty (A + B)
@@ -380,12 +473,13 @@ with tab_prediction:
 with tab_maneuver:
     st.subheader("Maneuver Simulator + Error Ellipsoids (3D)")
     st.caption(
-        "This uses a **simple linear relative-motion demo** around TCA: r(t)=r0+v0*t. "
-        "The maneuver plot is a visualization and does not change ML predictions unless you retrain your model."
+        "This is a **visual demo** using linear relative motion around TCA: r(t)=r0+v0*t.\n"
+        "It does not change ML predictions unless you include maneuver features in your model/training."
     )
 
+    # Try to use common relative state columns if present
     cols = list(df.columns)
-    state_cols_default = {
+    defaults = {
         "rx": "rel_x_km",
         "ry": "rel_y_km",
         "rz": "rel_z_km",
@@ -395,7 +489,7 @@ with tab_maneuver:
     }
 
     with st.expander("State configuration (optional)", expanded=False):
-        st.write("Select relative state columns if they exist in your CSV; otherwise demo values are used.")
+        st.write("If your CSV has relative position/velocity columns, select them; otherwise demo state is used.")
 
         def pick_col(label, default_name):
             candidates = [c for c in cols if c.lower() == default_name.lower()]
@@ -406,16 +500,16 @@ with tab_maneuver:
 
         cc1, cc2 = st.columns(2)
         with cc1:
-            rx_col = pick_col("Relative X (km)", state_cols_default["rx"])
-            ry_col = pick_col("Relative Y (km)", state_cols_default["ry"])
-            rz_col = pick_col("Relative Z (km)", state_cols_default["rz"])
+            rx_col = pick_col("Relative X (km)", defaults["rx"])
+            ry_col = pick_col("Relative Y (km)", defaults["ry"])
+            rz_col = pick_col("Relative Z (km)", defaults["rz"])
         with cc2:
-            vx_col = pick_col("Relative Vx (km/s)", state_cols_default["vx"])
-            vy_col = pick_col("Relative Vy (km/s)", state_cols_default["vy"])
-            vz_col = pick_col("Relative Vz (km/s)", state_cols_default["vz"])
+            vx_col = pick_col("Relative Vx (km/s)", defaults["vx"])
+            vy_col = pick_col("Relative Vy (km/s)", defaults["vy"])
+            vz_col = pick_col("Relative Vz (km/s)", defaults["vz"])
 
-    r0_demo = np.array([0.3, 0.2, 0.05])
-    v0_demo = np.array([-0.0006, 0.0004, 0.0])
+    r0_demo = np.array([0.3, 0.2, 0.05])            # km
+    v0_demo = np.array([-0.0006, 0.0004, 0.0])      # km/s
 
     def get_state_from_row(r):
         try:
@@ -447,11 +541,10 @@ with tab_maneuver:
     md_nom = float(miss_nom_km[tca_idx])
     md_man = float(miss_man_km[tca_idx])
 
-    k1, k2, k3, k4 = st.columns(4)
+    k1, k2, k3 = st.columns(3)
     k1.metric("Miss Distance @TCA (Nominal)", f"{md_nom * 1000:.1f} m")
     k2.metric("Miss Distance @TCA (Maneuvered)", f"{md_man * 1000:.1f} m")
     k3.metric("Increase", f"{(md_man - md_nom) * 1000:.1f} m")
-    k4.metric("ΔV", f"{delta_v:.2f} m/s")
 
     cov1 = default_cov(km_sigma=0.2)
     cov2 = default_cov(km_sigma=0.2)
@@ -499,55 +592,67 @@ with tab_maneuver:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    st.divider()
-    st.subheader("Save Scenario")
-    scenario_name = st.text_input("Scenario name", value=f"{selected_label} | ΔV {delta_v:.2f} m/s")
-    if st.button("💾 Save current scenario"):
-        st.session_state.scenarios.append({
-            "event": selected_label,
-            "scenario": scenario_name,
-            "delta_v_mps": float(delta_v),
-            "direction": burn_direction,
-            "miss_nom_m": md_nom * 1000.0,
-            "miss_man_m": md_man * 1000.0,
-            "increase_m": (md_man - md_nom) * 1000.0,
-            "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        })
-        st.success("Scenario saved ✅")
-
 # ==========================================================
 # TAB 4: Reports
 # ==========================================================
 with tab_reports:
-    st.subheader("Scenario Comparison Report")
+    st.subheader("Export Predictions")
+    st.caption("Generates predicted risk for the whole dataset and allows CSV download.")
 
-    if len(st.session_state.scenarios) == 0:
-        st.info("No scenarios saved yet. Go to the Maneuver tab and click “Save current scenario”.")
-    else:
-        report_df = pd.DataFrame(st.session_state.scenarios)
-        st.dataframe(report_df, use_container_width=True)
+    X_all_aligned, _ = build_model_input(df, model, feature_map)
+    kind_all, values_all = get_risk_output(model, X_all_aligned)
+    values_all = np.asarray(values_all, dtype=float).reshape(-1)
+    risk_all = normalize_0_1(values_all)
 
-        st.markdown("### Best Scenario (by miss distance increase) per event")
-        best = report_df.sort_values("increase_m", ascending=False).groupby("event", as_index=False).head(1)
-        st.dataframe(best, use_container_width=True)
+    out = df.copy()
+    out["predicted_raw"] = values_all
+    out["predicted_risk_score_0_1"] = risk_all
+    out["alert_flag"] = (risk_all >= risk_threshold).astype(int)
 
-        st.download_button(
-            "⬇️ Download Scenario Report CSV",
-            report_df.to_csv(index=False).encode("utf-8"),
-            file_name="scenario_report.csv",
-            mime="text/csv",
-        )
+    st.write("Preview:")
+    st.dataframe(out.head(50), use_container_width=True)
 
-        if st.button("🧹 Clear all saved scenarios"):
-            st.session_state.scenarios = []
-            st.success("Cleared ✅")
+    st.download_button(
+        "⬇️ Download Predictions CSV",
+        out.to_csv(index=False).encode("utf-8"),
+        file_name="collision_risk_predictions.csv",
+        mime="text/csv",
+    )
 
 # ==========================================================
-# Footer debug
+# Footer Help
 # ==========================================================
+st.divider()
+st.subheader("✅ If your risk chart is flat / constant")
+
+st.write(
+    "If you see almost the same risk for every row, it usually means **feature mismatch**.\n\n"
+    "**Best fix:** create a `feature_map.csv` in your repo like this:\n"
+)
+st.code(
+    "model_feature,original_feature\n"
+    "feature_0,time_to_tca\n"
+    "feature_1,miss_distance\n"
+    "feature_2,relative_speed\n"
+    "...\n",
+    language="text",
+)
+
+st.write(
+    "Your `feature_map.csv` must match the **exact features and order** used during training."
+)
+
 if show_debug:
-    st.divider()
-    st.subheader("Debug Info")
-    st.write("Model type:", type(model))
-    st.write("Has predict_proba:", hasattr(model, "predict_proba"))
-    st.write("Has decision_function:", hasattr(model, "decision_function"))
+    st.info("Debug mode is ON (sidebar). Turn it OFF once everything is working.")
+
+
+"""
+requirements.txt (recommended)
+----------------------------
+streamlit
+pandas
+numpy
+joblib
+scikit-learn
+plotly
+"""
