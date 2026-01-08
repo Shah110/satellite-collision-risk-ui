@@ -25,7 +25,7 @@ st.sidebar.markdown(
 
 st.sidebar.divider()
 st.sidebar.subheader("⚙️ Data / Model Settings")
-DATA_FILE = st.sidebar.text_input("Dataset file in repo", value="combined_data.csv")
+DATA_FILE = st.sidebar.text_input("Dataset file in repo", value="cleaned_train_final.csv")
 MODEL_FILE = st.sidebar.text_input("Model file in repo", value="collision_risk_model.pkl")
 TARGET_COL = st.sidebar.text_input("Target column (if exists)", value="risk")
 
