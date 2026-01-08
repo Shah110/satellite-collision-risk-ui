@@ -1,10 +1,15 @@
 import streamlit as st
+
+from streamlit_autorefresh import st_autorefresh
+st_autorefresh(interval=1000, key="tca_refresh")
+
 import pandas as pd
 import joblib
 from pathlib import Path
 from datetime import datetime, timedelta
 import numpy as np
 import plotly.graph_objects as go
+
 
 # ==========================================================
 # Page Config
