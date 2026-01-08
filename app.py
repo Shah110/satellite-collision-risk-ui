@@ -30,11 +30,11 @@ MODEL_FILE = st.sidebar.text_input("Model file in repo", value="collision_risk_m
 TARGET_COL = st.sidebar.text_input("Target column (if exists)", value="risk")
 
 use_uploader = st.sidebar.toggle("Use CSV uploader instead of repo file", value=False)
-show_debug = st.sidebar.toggle("Show debug panels", value=True)
+show_debug = st.sidebar.toggle("Show debug panels", value=False)
 
 st.sidebar.divider()
 st.sidebar.subheader("🧾 Feature Mapping (IMPORTANT)")
-FEATURE_MAP_FILE = st.sidebar.text_input("feature_map.csv (recommended)", value="feature_map.csv")
+FEATURE_MAP_FILE = st.sidebar.text_input("feature_map.csv", value="feature_map.csv")
 use_feature_map = st.sidebar.toggle("Use feature_map.csv to build model input", value=True)
 st.sidebar.caption("feature_map.csv columns: model_feature, original_feature")
 
@@ -71,11 +71,9 @@ def load_feature_map(path: str) -> dict:
     fm = pd.read_csv(path)
     if not {"model_feature", "original_feature"}.issubset(fm.columns):
         raise ValueError("feature_map.csv must contain columns: model_feature, original_feature")
-    # dict: model_feature -> original_feature
     return dict(zip(fm["model_feature"].astype(str), fm["original_feature"].astype(str)))
 
 def safe_numeric_only(df: pd.DataFrame) -> pd.DataFrame:
-    """Keep numeric columns only (coerce non-numeric to NaN then fill)."""
     X = df.copy()
     for c in X.columns:
         X[c] = pd.to_numeric(X[c], errors="coerce")
@@ -86,7 +84,6 @@ def normalize_0_1(x: np.ndarray) -> np.ndarray:
     if len(x) == 0:
         return x
     mn, mx = float(np.min(x)), float(np.max(x))
-    # already 0..1
     if mn >= -1e-9 and mx <= 1.0 + 1e-9:
         return np.clip(x, 0.0, 1.0)
     if np.isclose(mx - mn, 0.0):
@@ -94,12 +91,6 @@ def normalize_0_1(x: np.ndarray) -> np.ndarray:
     return (x - mn) / (mx - mn)
 
 def get_risk_output(model, X_aligned: pd.DataFrame):
-    """
-    Returns (kind, values)
-    kind: 'proba' | 'score' | 'pred'
-    values: 1D array
-    """
-    # probabilities
     if hasattr(model, "predict_proba"):
         try:
             p = np.asarray(model.predict_proba(X_aligned))
@@ -110,7 +101,6 @@ def get_risk_output(model, X_aligned: pd.DataFrame):
         except Exception:
             pass
 
-    # decision score
     if hasattr(model, "decision_function"):
         try:
             s = model.decision_function(X_aligned)
@@ -118,7 +108,6 @@ def get_risk_output(model, X_aligned: pd.DataFrame):
         except Exception:
             pass
 
-    # fallback prediction
     y = model.predict(X_aligned)
     return "pred", np.asarray(y).reshape(-1)
 
@@ -218,34 +207,19 @@ def show_risk_badge(score_0_1: float):
         st.success(f"✅ OK: Risk Score {score_0_1:.3f} < {risk_threshold:.2f}")
 
 def try_infer_mapping_by_numeric_order(df: pd.DataFrame, expected: list[str]) -> dict:
-    """
-    Last-resort: map expected model columns to the first N numeric columns in the CSV.
-    This is NOT scientifically correct unless your training used the same order.
-    """
     numeric_cols = list(safe_numeric_only(df).columns)
     n = min(len(expected), len(numeric_cols))
     return {expected[i]: numeric_cols[i] for i in range(n)}
 
-def build_model_input(df: pd.DataFrame, model, fmap: dict | None):
-    """
-    Build X for the model:
-    1) If model.feature_names_in_ exists:
-       - If df already contains those columns -> align directly
-       - Else if fmap provided -> map original columns to model columns
-       - Else -> infer mapping by numeric order (warn)
-    2) If model has no feature_names_in_:
-       - Use numeric columns as-is
-    Returns: (X_aligned, debug_info_dict)
-    """
+def build_model_input(df: pd.DataFrame, model, fmap: dict | None, target_col: str):
     debug = {}
-    X_src = df.drop(columns=[TARGET_COL], errors="ignore")
+    X_src = df.drop(columns=[target_col], errors="ignore")
 
     if hasattr(model, "feature_names_in_"):
         expected = list(model.feature_names_in_)
         debug["expected_count"] = len(expected)
         debug["expected"] = expected
 
-        # Case A: dataset already has expected model columns
         if all(c in X_src.columns for c in expected):
             Xnum = safe_numeric_only(X_src)
             X_aligned = Xnum.reindex(columns=expected, fill_value=0)
@@ -254,14 +228,12 @@ def build_model_input(df: pd.DataFrame, model, fmap: dict | None):
             debug["extra"] = [c for c in Xnum.columns if c not in expected]
             return X_aligned, debug
 
-        # Case B: use feature map (recommended)
         if fmap:
             X_out = pd.DataFrame(index=df.index)
             missing_from_csv = []
             for model_col in expected:
                 orig_col = fmap.get(model_col)
                 if orig_col is None:
-                    # mapping not provided for this expected model feature
                     X_out[model_col] = 0.0
                     missing_from_csv.append(f"(no map) {model_col}")
                     continue
@@ -276,7 +248,6 @@ def build_model_input(df: pd.DataFrame, model, fmap: dict | None):
             debug["extra"] = [c for c in X_src.columns if c not in set(fmap.values())]
             return X_out, debug
 
-        # Case C: infer mapping by numeric order (last resort)
         inferred = try_infer_mapping_by_numeric_order(X_src, expected)
         X_out = pd.DataFrame(index=df.index)
         for model_col in expected:
@@ -290,12 +261,10 @@ def build_model_input(df: pd.DataFrame, model, fmap: dict | None):
         debug["inferred_map_preview"] = dict(list(inferred.items())[:10])
         return X_out, debug
 
-    # No expected feature names known: just numeric
     Xnum = safe_numeric_only(X_src)
     debug["mode"] = "no_feature_names_in_model"
     debug["provided_numeric_cols"] = list(Xnum.columns)
     return Xnum, debug
-
 
 # ==========================================================
 # Load Dataset
@@ -326,11 +295,11 @@ try:
     model = load_model(MODEL_FILE)
 except Exception as e:
     st.error(f"Failed to load model: {e}")
-    st.info("If you see 'No module named sklearn', add scikit-learn to requirements.txt and redeploy.")
+    st.info("If you see 'No module named sklearn', add scikit-learn to requirements.txt and reboot Streamlit.")
     st.stop()
 
 # ==========================================================
-# Load Feature Map (optional but recommended)
+# Load Feature Map
 # ==========================================================
 feature_map = None
 if use_feature_map and FEATURE_MAP_FILE and Path(FEATURE_MAP_FILE).exists():
@@ -341,8 +310,7 @@ if use_feature_map and FEATURE_MAP_FILE and Path(FEATURE_MAP_FILE).exists():
         st.sidebar.error(f"feature_map.csv error: {e}")
         feature_map = None
 elif use_feature_map:
-    st.sidebar.warning("feature_map.csv not found. Predictions may become constant if your model expects feature_0..")
-    feature_map = None
+    st.sidebar.warning("feature_map.csv not found. If your model expects feature_0.., outputs may be constant.")
 
 # ==========================================================
 # Event selector
@@ -357,7 +325,7 @@ row_idx = label_to_index[selected_label]
 row = df.loc[row_idx]
 
 # ==========================================================
-# Countdown (TCA)
+# Countdown
 # ==========================================================
 st.header("⏱️ TCA Countdown")
 make_countdown_card(tca_dt)
@@ -379,11 +347,9 @@ with tab_dataset:
     with st.expander("Show dataset preview", expanded=True):
         st.dataframe(df.head(50), use_container_width=True)
 
-    # Build model input for ALL rows
-    X_all_aligned, dbg_all = build_model_input(df, model, feature_map)
-
-    # Run model output
+    X_all_aligned, dbg_all = build_model_input(df, model, feature_map, TARGET_COL)
     kind_all, values_all = get_risk_output(model, X_all_aligned)
+
     values_all = np.asarray(values_all, dtype=float).reshape(-1)
     risk_all = normalize_0_1(values_all)
 
@@ -394,16 +360,7 @@ with tab_dataset:
     c3.metric("Unique raw outputs", f"{len(np.unique(values_all)):,}")
     c4.metric("Std (raw)", f"{np.std(values_all):.6f}")
 
-    with st.expander("Describe (raw outputs)", expanded=False):
-        st.write(pd.Series(values_all).describe())
-
-    # Warn if output is almost constant
-    if len(np.unique(values_all)) <= 2 or np.isclose(np.std(values_all), 0.0):
-        st.warning(
-            "Your model outputs look almost constant across the dataset.\n\n"
-            "Most common cause: **feature mismatch** (inputs became all zeros because column names don't match).\n"
-            "Fix: provide a correct **feature_map.csv** mapping your real columns → model_feature (e.g., feature_0..)."
-        )
+    is_flat = (len(np.unique(values_all)) <= 2) or (np.isclose(np.std(values_all), 0.0))
 
     st.subheader("Risk Score Distribution (0–1)")
     if len(np.unique(risk_all)) == 1:
@@ -414,22 +371,11 @@ with tab_dataset:
         fig.update_layout(height=360, xaxis_title="Risk Score (0–1)", yaxis_title="Count", bargap=0.05)
         st.plotly_chart(fig, use_container_width=True)
 
-    st.caption(
-        f"Input build mode: **{dbg_all.get('mode','?')}**. "
-        "Risk Score is normalized to 0–1 for visualization (not necessarily a true probability)."
-    )
+    st.caption(f"Input build mode: **{dbg_all.get('mode','?')}**")
 
     if show_debug:
         with st.expander("Debug: Model input wiring", expanded=False):
-            st.write("Build mode:", dbg_all.get("mode"))
-            if "expected_count" in dbg_all:
-                st.write("Model expected features:", dbg_all["expected_count"])
-            if "missing" in dbg_all:
-                st.write("Missing (filled with 0) sample:", dbg_all["missing"][:30])
-            if "extra" in dbg_all:
-                st.write("Extra sample:", dbg_all["extra"][:30])
-            if "inferred_map_preview" in dbg_all:
-                st.write("Inferred mapping preview (first 10):", dbg_all["inferred_map_preview"])
+            st.write(dbg_all)
             st.write("X_all_aligned shape:", X_all_aligned.shape)
             st.write("X_all_aligned head:", X_all_aligned.head())
 
@@ -440,8 +386,9 @@ with tab_prediction:
     st.subheader("Prediction for Selected Event")
     single_df = pd.DataFrame([row])
 
-    X1_aligned, dbg1 = build_model_input(single_df, model, feature_map)
+    X1_aligned, dbg1 = build_model_input(single_df, model, feature_map, TARGET_COL)
     kind1, values1 = get_risk_output(model, X1_aligned)
+
     raw_value = float(np.asarray(values1).reshape(-1)[0]) if len(values1) else 0.0
     risk_score = float(normalize_0_1(np.array([raw_value]))[0])
 
@@ -463,33 +410,27 @@ with tab_prediction:
 
     if show_debug:
         with st.expander("Debug: Selected Event wiring", expanded=False):
-            st.write("Build mode:", dbg1.get("mode"))
-            st.write("X1_aligned columns:", list(X1_aligned.columns))
+            st.write(dbg1)
             st.write("X1_aligned values:", X1_aligned.iloc[0].to_dict())
 
 # ==========================================================
-# TAB 3: Maneuver + Uncertainty (A + B)
+# TAB 3: Maneuver + Uncertainty
 # ==========================================================
 with tab_maneuver:
     st.subheader("Maneuver Simulator + Error Ellipsoids (3D)")
     st.caption(
         "This is a **visual demo** using linear relative motion around TCA: r(t)=r0+v0*t.\n"
-        "It does not change ML predictions unless you include maneuver features in your model/training."
+        "It does not change ML predictions unless maneuver features are part of the model."
     )
 
-    # Try to use common relative state columns if present
     cols = list(df.columns)
     defaults = {
-        "rx": "rel_x_km",
-        "ry": "rel_y_km",
-        "rz": "rel_z_km",
-        "vx": "rel_vx_kms",
-        "vy": "rel_vy_kms",
-        "vz": "rel_vz_kms",
+        "rx": "rel_x_km", "ry": "rel_y_km", "rz": "rel_z_km",
+        "vx": "rel_vx_kms", "vy": "rel_vy_kms", "vz": "rel_vz_kms",
     }
 
     with st.expander("State configuration (optional)", expanded=False):
-        st.write("If your CSV has relative position/velocity columns, select them; otherwise demo state is used.")
+        st.write("Select relative position/velocity columns if they exist; otherwise demo state is used.")
 
         def pick_col(label, default_name):
             candidates = [c for c in cols if c.lower() == default_name.lower()]
@@ -508,8 +449,8 @@ with tab_maneuver:
             vy_col = pick_col("Relative Vy (km/s)", defaults["vy"])
             vz_col = pick_col("Relative Vz (km/s)", defaults["vz"])
 
-    r0_demo = np.array([0.3, 0.2, 0.05])            # km
-    v0_demo = np.array([-0.0006, 0.0004, 0.0])      # km/s
+    r0_demo = np.array([0.3, 0.2, 0.05])
+    v0_demo = np.array([-0.0006, 0.0004, 0.0])
 
     def get_state_from_row(r):
         try:
@@ -529,7 +470,6 @@ with tab_maneuver:
     t = np.linspace(-span_hours * 3600, span_hours * 3600, N)
 
     r_nom = propagate_relative_motion(r0_km, v0_kms, t)
-
     dv_kms = delta_v / 1000.0
     v_man = apply_delta_v(v0_kms, dv_kms, burn_direction)
     r_man = propagate_relative_motion(r0_km, v_man, t)
@@ -597,10 +537,11 @@ with tab_maneuver:
 # ==========================================================
 with tab_reports:
     st.subheader("Export Predictions")
-    st.caption("Generates predicted risk for the whole dataset and allows CSV download.")
+    st.caption("Generate predicted risk for the whole dataset and download.")
 
-    X_all_aligned, _ = build_model_input(df, model, feature_map)
+    X_all_aligned, _ = build_model_input(df, model, feature_map, TARGET_COL)
     kind_all, values_all = get_risk_output(model, X_all_aligned)
+
     values_all = np.asarray(values_all, dtype=float).reshape(-1)
     risk_all = normalize_0_1(values_all)
 
@@ -609,7 +550,6 @@ with tab_reports:
     out["predicted_risk_score_0_1"] = risk_all
     out["alert_flag"] = (risk_all >= risk_threshold).astype(int)
 
-    st.write("Preview:")
     st.dataframe(out.head(50), use_container_width=True)
 
     st.download_button(
@@ -620,31 +560,42 @@ with tab_reports:
     )
 
 # ==========================================================
-# Footer Help
+# Conditional Footer (UPDATED)
+#   Show "flat/constant" help ONLY when needed
 # ==========================================================
 st.divider()
-st.subheader("✅ If your risk chart is flat / constant")
 
-st.write(
-    "If you see almost the same risk for every row, it usually means **feature mismatch**.\n\n"
-    "**Best fix:** create a `feature_map.csv` in your repo like this:\n"
-)
-st.code(
-    "model_feature,original_feature\n"
-    "feature_0,time_to_tca\n"
-    "feature_1,miss_distance\n"
-    "feature_2,relative_speed\n"
-    "...\n",
-    language="text",
-)
+# Compute flatness using the same arrays produced in Reports/Dataset
+# (If something fails, we just skip the helper)
+is_flat_footer = False
+try:
+    X_tmp, _ = build_model_input(df, model, feature_map, TARGET_COL)
+    _, vals_tmp = get_risk_output(model, X_tmp)
+    vals_tmp = np.asarray(vals_tmp, dtype=float).reshape(-1)
+    is_flat_footer = (len(np.unique(vals_tmp)) <= 2) or (np.isclose(np.std(vals_tmp), 0.0))
+except Exception:
+    pass
 
-st.write(
-    "Your `feature_map.csv` must match the **exact features and order** used during training."
-)
+if is_flat_footer:
+    st.subheader("✅ If your risk chart is flat / constant")
+    st.write(
+        "If you see almost the same risk for every row, it usually means **feature mismatch**.\n\n"
+        "**Best fix:** create a `feature_map.csv` in your repo like this:"
+    )
+    st.code(
+        "model_feature,original_feature\n"
+        "feature_0,time_to_tca\n"
+        "feature_1,miss_distance\n"
+        "feature_2,relative_speed\n"
+        "...\n",
+        language="text",
+    )
+    st.write("Your `feature_map.csv` must match the exact features and order used during training.")
+else:
+    st.success("✅ Risk outputs look non-constant. Feature mapping is working.")
 
 if show_debug:
     st.info("Debug mode is ON (sidebar). Turn it OFF once everything is working.")
-
 
 """
 requirements.txt (recommended)
