@@ -1,0 +1,11 @@
+model_feature,original_feature
+feature_0,time_to_tca
+feature_1,max_risk_estimate
+feature_2,max_risk_scaling
+feature_3,miss_distance
+feature_4,relative_speed
+feature_5,relative_position_r
+feature_6,relative_position_t
+feature_7,relative_position_n
+feature_8,relative_velocity_r
+feature_9,relative_velocity_t
